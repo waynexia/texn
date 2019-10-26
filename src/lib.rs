@@ -1,32 +1,31 @@
-// use chashmap::CHashMap;
 use crossbeam::channel::Select;
-use crossbeam::{channel, Receiver, Sender};
+use crossbeam::{channel, Sender};
 use futures::future::BoxFuture;
 use futures::prelude::*;
-use lru_time_cache::LruCache;
 use num_cpus;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
-// use std::panic;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-// mod dropmap;
+use dropmap::DropMap;
+
+mod dropmap;
 
 // take how many tasks from a queue in one term
-const QUEUE_PRIVILIAGE: &'static [u64] = &[256, 1, 1];
+const QUEUE_PRIVILIAGE: &'static [u64] = &[512, 8, 1];
 // the longest executed time a queue can hold (in micros)
 const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
 // hashmap capacity
-const MAX_ENTRY: usize = 100_000;
+// const MAX_ENTRY: usize = 100_000;
 // time to live of a hashmap entry (in seconds)
-const TTL: u64 = 20;
+// const TTL: u64 = 20;
 
 // external upper level tester
 use adaptive_spawn::*;
@@ -43,7 +42,7 @@ pub struct ThreadPool {
     // queues: Vec<Arc<TaskQueue>>,
     queues: Arc<[Sender<ArcTask>]>,
     // stats: token -> (executed_time(in micros),queue_index)
-    stats: Arc<Mutex<LruCache<u64, (Arc<AtomicU64>, usize)>>>,
+    stats: DropMap<u64, (Arc<AtomicU64>, Arc<AtomicUsize>)>,
     num_threads: usize,
     first_queue_iter: Arc<AtomicUsize>,
 }
@@ -60,9 +59,7 @@ impl ThreadPool {
             rxs.push(rx);
         }
         // create stats
-        let ttl = Duration::from_secs(TTL);
-        let stats_for_constructor = LruCache::with_expiry_duration_and_capacity(ttl, MAX_ENTRY);
-        let stats_for_constructor = Arc::new(Mutex::new(stats_for_constructor));
+        let stats = DropMap::new();
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
         // spawn threads
         for _ in 0..num_threads {
@@ -102,7 +99,7 @@ impl ThreadPool {
         ThreadPool {
             first_queues,
             queues,
-            stats: stats_for_constructor,
+            stats,
             num_threads,
             first_queue_iter: Arc::default(),
         }
@@ -112,14 +109,15 @@ impl ThreadPool {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut stats = self.stats.lock().unwrap();
         // at begin a token has top priority
-        if !stats.contains_key(&token) {
-            stats.insert(token, (Arc::default(), 0));
+        if !self.stats.contains_key(&token) {
+            self.stats
+                .insert_new(token, (Arc::default(), Arc::default()));
         }
         // otherwise use its own priority
-        let (elapsed, index) = &*stats.get_mut(&token).unwrap();
-        if index == &0 {
+        let (atom_elapsed, atom_index) = &*self.stats.get(&token).unwrap();
+        let index = atom_index.load(Ordering::SeqCst);
+        if index == 0 {
             // println!(
             //     "push into {}",
             //     self.first_queue_iter.load(Ordering::SeqCst) % self.num_threads
@@ -131,19 +129,19 @@ impl ThreadPool {
                     task,
                     sender.clone(),
                     self.queues.clone(),
-                    *index,
-                    elapsed.clone(),
+                    index,
+                    atom_elapsed.clone(),
                 ))
                 .unwrap();
         } else {
-            self.queues[*index]
+            self.queues[index]
                 .send(ArcTask::new(
                     task,
                     // don't care
                     self.first_queues[0].clone(),
                     self.queues.clone(),
-                    *index,
-                    elapsed.clone(),
+                    index,
+                    atom_elapsed.clone(),
                 ))
                 .unwrap();
         }
@@ -185,11 +183,6 @@ impl Default for ThreadPool {
     fn default() -> ThreadPool {
         ThreadPool::new(num_cpus::get_physical())
     }
-}
-
-struct TaskQueue {
-    tx: Sender<ArcTask>,
-    rx: Receiver<ArcTask>,
 }
 
 struct Task {
