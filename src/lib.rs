@@ -17,9 +17,11 @@ use std::thread;
 use std::time::Instant;
 
 // take how many tasks from a queue in one term
-const QUEUE_PRIVILIAGE: &'static [u64] = &[16, 4, 1];
+const QUEUE_PRIVILIAGE: &'static [u64] = &[1024, 1, 1, 1, 1];
 // the longest executed time a queue can hold (in micros)
-const FEEDBACK_LEVEL: &'static [u64] = &[1_000, 10_000, 100_000];
+const TIME_FEEDBACK: &'static [u64] = &[1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+// the most appear times a queue can hold
+const CNT_FEEDBACK: &'static [u64] = &[5, 10, 15, 20, 25];
 
 use adaptive_spawn::*;
 
@@ -86,8 +88,18 @@ impl ThreadPool {
             self.stats.insert(token, (1, 0, 0));
         }
         // otherwise use its own priority
-        let index = self.stats.get(&token).unwrap().2;
-        self.stats.upsert(token, || panic!(), |(v, _, _)| *v += 1);
+        let (cnt, _, mut index) = *self.stats.get(&token).unwrap();
+        if cnt > CNT_FEEDBACK[index] && index < CNT_FEEDBACK.len() - 1 {
+            index += 1;
+        }
+        self.stats.upsert(
+            token,
+            || panic!(),
+            |(c, _, i)| {
+                *c += 1;
+                *i = index
+            },
+        );
         let _ = self.queues[index]
             .tx
             .send(ArcTask::new(task, self.queues.clone(), token, index));
@@ -107,7 +119,7 @@ unsafe fn poll_with_timer(
         let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
         return;
     }
-    if elapsed > FEEDBACK_LEVEL[index] && index < FEEDBACK_LEVEL.len() - 1 {
+    if elapsed > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1 {
         index += 1;
         task.0.index.store(index, Ordering::SeqCst);
         stats.upsert(token, || panic!(), |(_, _, i)| *i = index);
