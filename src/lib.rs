@@ -44,8 +44,7 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
-    pub fn new<F>(num_threads: usize,f: F) -> ThreadPool
-    where  F: Fn() + Send + Sync + 'static,{
+    pub fn new(num_threads: usize,f: Arc<dyn Fn() + Send + Sync + 'static>) -> ThreadPool{
         let mut queues = Vec::new();
         let mut rxs = Vec::new();
         let mut first_queues = Vec::new();
@@ -58,7 +57,6 @@ impl ThreadPool {
         // create stats
         let stats = DropMap::new();
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
-        let f = Arc::new(f);
         // spawn threads
         for _ in 0..num_threads {
             let (tx, rx) = channel::unbounded();
@@ -181,7 +179,7 @@ impl AdaptiveSpawn for ThreadPool {
 
 impl Default for ThreadPool {
     fn default() -> ThreadPool {
-        ThreadPool::new(num_cpus::get_physical(),||{})
+        ThreadPool::new(num_cpus::get_physical(),Arc::new(||{}))
     }
 }
 
