@@ -23,6 +23,11 @@ const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
 // the most appear times a queue can hold
 const CNT_FEEDBACK: &'static [u64] = &[5, 10, 15];
 
+// hashmap capacity
+const MAX_ENTRY: usize = 100_000;
+// time to live of a hashmap entry (in seconds)
+const TTL: u64 = 60;
+
 use adaptive_spawn::*;
 
 // fn foo() -> ! {
@@ -33,7 +38,7 @@ use adaptive_spawn::*;
 pub struct ThreadPool {
     queues: Vec<Arc<TaskQueue>>,
     // stats: token -> (appear_times,executed_time(in micros),queue_index)
-    stats: Arc<CHashMap<u64, (u64, u64, usize)>>,
+    stats: Arc<CHashMap<u64, (u64, u64, usize, Instant)>>,
 }
 
 impl ThreadPool {
@@ -83,19 +88,24 @@ impl ThreadPool {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        // clear old entry
+        if self.stats.len() > MAX_ENTRY {
+            self.stats
+                .retain(|_, (_, _, _, start_time)| start_time.elapsed().as_secs() <= TTL);
+        }
         // at begin a token has top priority
         if !self.stats.contains_key(&token) {
-            self.stats.insert(token, (1, 0, 0));
+            self.stats.insert(token, (1, 0, 0, Instant::now()));
         }
         // otherwise use its own priority
-        let (cnt, _, mut index) = *self.stats.get(&token).unwrap();
+        let (cnt, _, mut index, _) = *self.stats.get(&token).unwrap();
         // if cnt > CNT_FEEDBACK[index] && index < CNT_FEEDBACK.len() - 1 {
         //     index += 1;
         // }
         self.stats.upsert(
             token,
             || panic!(),
-            |(c, _, i)| {
+            |(c, _, i, _)| {
                 *c += 1;
                 *i = index
             },
@@ -108,13 +118,13 @@ impl ThreadPool {
 }
 
 unsafe fn poll_with_timer(
-    stats: &CHashMap<u64, (u64, u64, usize)>,
+    stats: &CHashMap<u64, (u64, u64, usize, Instant)>,
     task: ArcTask,
     incoming_index: usize,
 ) {
     let token = task.0.token;
     // adjust queue level
-    let (_, elapsed, mut index) = *stats.get(&token).unwrap();
+    let (_, elapsed, mut index, _) = *stats.get(&token).unwrap();
     if incoming_index != index {
         let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
         return;
@@ -122,7 +132,7 @@ unsafe fn poll_with_timer(
     if elapsed > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1 {
         index += 1;
         task.0.index.store(index, Ordering::SeqCst);
-        stats.upsert(token, || panic!(), |(_, _, i)| *i = index);
+        stats.upsert(token, || panic!(), |(_, _, i, _)| *i = index);
         let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
         return;
     }
@@ -130,7 +140,7 @@ unsafe fn poll_with_timer(
     let begin = Instant::now();
     task.poll();
     let elapsed = begin.elapsed().as_micros() as u64;
-    stats.upsert(token, || panic!(), |(_, e, _)| *e += elapsed);
+    stats.upsert(token, || panic!(), |(_, e, _, _)| *e += elapsed);
 }
 
 impl AdaptiveSpawn for ThreadPool {
