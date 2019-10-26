@@ -5,11 +5,9 @@ Each time a thread takes a task from one queue (decide by itself) and execute.
 - A thread take tasks from many queues in a round-robin way. Priority influence
 how many times will a thread take a task from a queue in one term. Every tasks
 have chances to be executed so starvation problem is avoided.
-- One token with more task appeared before will has lower priority. Only when
-pushing a task into the queue will consider token and nice.
-- A task will always stay in one exactly queue.
+- One token with more total executed time has lower priority.
 
-*time and nice will not be implemented for now*
+*nice will not be implemented for now*
 
 ## Data Structure
 - ThreadPool
@@ -41,3 +39,8 @@ into head
 - waker
 ```rust
 ```
+
+## Possible Optimization
+- take time into consideration
+- after polled one task, try to push it in the front rather than tail
+- dynamic adjust which queue a task belong to

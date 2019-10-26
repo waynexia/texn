@@ -1,5 +1,5 @@
 use chashmap::CHashMap;
-use crossbeam::channel::{Select, TryRecvError};
+use crossbeam::channel::Select;
 use crossbeam::{channel, Receiver, Sender};
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -10,12 +10,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
 use std::panic;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
+use std::time::Instant;
 
-const QUEUE_PRIVILIAGE: &'static [u64] = &[1, 5, 25];
+// take how many tasks from a queue in one term
+const QUEUE_PRIVILIAGE: &'static [u64] = &[16, 4, 1];
+// the longest executed time a queue can hold (in micros)
+const FEEDBACK_LEVEL: &'static [u64] = &[1_000, 10_000, 100_000];
 
 use adaptive_spawn::*;
 
@@ -26,7 +30,8 @@ use adaptive_spawn::*;
 #[derive(Clone)]
 pub struct ThreadPool {
     queues: Vec<Arc<TaskQueue>>,
-    stats: CHashMap<u64, u64>,
+    // stats: token -> (appear_times,executed_time(in micros),queue_index)
+    stats: Arc<CHashMap<u64, (u64, u64, usize)>>,
 }
 
 impl ThreadPool {
@@ -37,9 +42,10 @@ impl ThreadPool {
             let queue = Arc::new(TaskQueue { tx, rx });
             queues.push(queue);
         }
-        // let queues = Arc::new(queues);
+        let stats_for_constructor = Arc::new(CHashMap::new());
         for _ in 0..num_threads {
             let queues = queues.clone();
+            let stats = stats_for_constructor.clone();
             thread::spawn(move || {
                 let mut sel = Select::new();
                 let mut rx_map = HashMap::new();
@@ -48,34 +54,26 @@ impl ThreadPool {
                     rx_map.insert(idx, &queue.rx);
                 }
                 loop {
-                    // let mut index = 0;
                     let mut is_empty = true;
-                    for (queue, &limit) in queues.iter().zip(QUEUE_PRIVILIAGE) {
+                    for ((queue, &limit), index) in queues.iter().zip(QUEUE_PRIVILIAGE).zip(0..) {
                         for task in queue.rx.try_iter().take(limit as usize) {
                             is_empty = false;
-                            unsafe { task.poll() };
+                            unsafe { poll_with_timer(&stats, task, index) };
                         }
-                        // let mut exec_cnt = 0;
-                        // while exec_cnt < QUEUE_PRIVILIAGE[index] {
-                        //     if let Ok(task) = queue.rx.try_recv() {
-                        //         unsafe { task.poll() };
-                        //         exec_cnt += 1;
-                        //     }
-                        // }
-                        // index += 1;
                     }
                     if is_empty {
                         let oper = sel.select();
                         let rx = rx_map.get(&oper.index()).unwrap();
                         let task = oper.recv(*rx).unwrap();
-                        unsafe { task.poll() };
+                        let index = task.0.index.load(Ordering::SeqCst);
+                        unsafe { poll_with_timer(&stats, task, index) };
                     }
                 }
             });
         }
         ThreadPool {
             queues,
-            stats: CHashMap::new(),
+            stats: stats_for_constructor,
         }
     }
 
@@ -83,17 +81,44 @@ impl ThreadPool {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        // at begin a token has top priority
         if !self.stats.contains_key(&token) {
-            self.stats.insert(token, 1);
+            self.stats.insert(token, (1, 0, 0));
         }
-        let mut index = QUEUE_PRIVILIAGE.len() - 1;
-        while index > 0 && QUEUE_PRIVILIAGE[index] < *self.stats.get(&token).unwrap() {
-            index -= 1;
-        }
-        self.stats.upsert(token, || panic!(), |v| *v += 1);
-        let queue = self.queues[index].clone();
-        let _ = queue.tx.send(ArcTask::new(task, queue.clone()));
+        // otherwise use its own priority
+        let index = self.stats.get(&token).unwrap().2;
+        self.stats.upsert(token, || panic!(), |(v, _, _)| *v += 1);
+        let _ = self.queues[index]
+            .tx
+            .send(ArcTask::new(task, self.queues.clone(), token, index));
+        // println!("{:?}", self.stats);
     }
+}
+
+unsafe fn poll_with_timer(
+    stats: &CHashMap<u64, (u64, u64, usize)>,
+    task: ArcTask,
+    incoming_index: usize,
+) {
+    let token = task.0.token;
+    // adjust queue level
+    let (_, elapsed, mut index) = *stats.get(&token).unwrap();
+    if incoming_index != index {
+        let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
+        return;
+    }
+    if elapsed > FEEDBACK_LEVEL[index] && index < FEEDBACK_LEVEL.len() - 1 {
+        index += 1;
+        task.0.index.store(index, Ordering::SeqCst);
+        stats.upsert(token, || panic!(), |(_, _, i)| *i = index);
+        let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
+        return;
+    }
+    // polling
+    let begin = Instant::now();
+    task.poll();
+    let elapsed = begin.elapsed().as_micros() as u64;
+    stats.upsert(token, || panic!(), |(_, e, _)| *e += elapsed);
 }
 
 impl AdaptiveSpawn for ThreadPool {
@@ -118,8 +143,11 @@ struct TaskQueue {
 
 struct Task {
     task: UnsafeCell<BoxFuture<'static, ()>>,
-    queue: Arc<TaskQueue>,
+    queues: Vec<Arc<TaskQueue>>,
     status: AtomicU8,
+    token: u64,
+    // this token belongs to which queue
+    index: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -134,14 +162,16 @@ unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
 impl ArcTask {
-    fn new<F>(future: F, queue: Arc<TaskQueue>) -> ArcTask
+    fn new<F>(future: F, queues: Vec<Arc<TaskQueue>>, token: u64, index: usize) -> ArcTask
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let future = Arc::new(Task {
             task: UnsafeCell::new(future.boxed()),
-            queue,
+            queues,
             status: AtomicU8::new(WAITING),
+            token,
+            index: AtomicUsize::new(index),
         });
         let future: *const Task = Arc::into_raw(future) as *const Task;
         unsafe { task(future) }
@@ -149,7 +179,6 @@ impl ArcTask {
 
     unsafe fn poll(self) {
         self.0.status.store(POLLING, Ordering::SeqCst);
-        // let waker = waker(&self);
         let waker = ManuallyDrop::new(waker(&*self.0));
         let mut cx = Context::from_waker(&waker);
         loop {
@@ -177,7 +206,6 @@ unsafe fn waker(task: *const Task) -> Waker {
 }
 
 unsafe fn clone_raw(this: *const ()) -> RawWaker {
-    // let task = this as *const Task;
     let task = clone_task(this as *const Task);
     RawWaker::new(
         Arc::into_raw(task.0) as *const (),
@@ -186,7 +214,6 @@ unsafe fn clone_raw(this: *const ()) -> RawWaker {
 }
 
 unsafe fn drop_raw(this: *const ()) {
-    // drop(this as * const Task)
     drop(task(this as *const Task))
 }
 
@@ -203,7 +230,10 @@ unsafe fn wake_raw(this: *const ()) {
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        task.0.queue.tx.send(clone_task(&*task.0)).unwrap();
+                        task.0.queues[task.0.index.load(Ordering::SeqCst)]
+                            .tx
+                            .send(clone_task(&*task.0))
+                            .unwrap();
                         break;
                     }
                     Err(cur) => status = cur,
@@ -238,7 +268,10 @@ unsafe fn wake_ref_raw(this: *const ()) {
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        task.0.queue.tx.send(clone_task(&*task.0)).unwrap();
+                        task.0.queues[task.0.index.load(Ordering::SeqCst)]
+                            .tx
+                            .send(clone_task(&*task.0))
+                            .unwrap();
                         break;
                     }
                     Err(cur) => status = cur,
