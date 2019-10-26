@@ -2,10 +2,14 @@ use crossbeam::channel::Select;
 use crossbeam::{channel, Sender};
 use futures::future::BoxFuture;
 use futures::prelude::*;
+use lazy_static::lazy_static;
 use num_cpus;
+use serde::Deserialize;
+use toml;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::fs::read_to_string;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -18,13 +22,33 @@ use dropmap::DropMap;
 
 mod dropmap;
 
+#[derive(Debug, Deserialize)]
+struct Config {
+    num_thread: usize,
+    // dropmap swap interval (in secs)
+    swap_interval: u64,
+    queue_privilige: Vec<u64>,
+    time_feedback: Vec<u64>,
+}
+
+lazy_static! {
+    static ref CONFIG: Config = {
+        let content = read_to_string("/root/config.toml").unwrap();
+        toml::from_str(&content).unwrap()
+    };
+    // take how many tasks from a queue in one term
+    static ref QUEUE_PRIVILIAGE:&'static[u64] = &CONFIG.queue_privilige;
+    // the longest executed time a queue can hold (in micros)
+    static ref TIME_FEEDBACK:&'static[u64] = &CONFIG.time_feedback;
+}
+
 // take how many tasks from a queue in one term
-const QUEUE_PRIVILIAGE: &'static [u64] = &[512, 8, 1];
+// const QUEUE_PRIVILIAGE: &'static [u64] = &[512, 8, 1];
 // the longest executed time a queue can hold (in micros)
-const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
+// const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
 
 // external upper level tester
-use adaptive_spawn::*;
+use adaptive_spawn::{AdaptiveSpawn,Options};
 
 #[derive(Clone)]
 pub struct ThreadPool {
@@ -40,18 +64,18 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
-    pub fn new(num_threads: usize,f: Arc<dyn Fn() + Send + Sync + 'static>) -> ThreadPool{
+    pub fn new(num_threads: usize, f: Arc<dyn Fn() + Send + Sync + 'static>) -> ThreadPool {
         let mut queues = Vec::new();
         let mut rxs = Vec::new();
         let mut first_queues = Vec::new();
-        for _ in QUEUE_PRIVILIAGE {
+        for _ in QUEUE_PRIVILIAGE.into_iter() {
             let (tx, rx) = channel::unbounded();
             // let queue = Arc::new(TaskQueue { tx, rx });
             queues.push(tx);
             rxs.push(rx);
         }
         // create stats
-        let stats = DropMap::new();
+        let stats = DropMap::new(CONFIG.swap_interval);
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
         // spawn threads
         for _ in 0..num_threads {
@@ -71,7 +95,7 @@ impl ThreadPool {
                 }
                 loop {
                     let mut is_empty = true;
-                    for ((rx, &limit), index) in rxs.iter().zip(QUEUE_PRIVILIAGE).zip(0..) {
+                    for ((rx, &limit), index) in rxs.iter().zip(QUEUE_PRIVILIAGE.into_iter()).zip(0..) {
                         for task in rx.try_iter().take(limit as usize) {
                             is_empty = false;
                             unsafe { poll_with_timer(task, index) };
@@ -80,7 +104,7 @@ impl ThreadPool {
                     if is_empty {
                         let oper = sel.select();
                         let rx = rx_map.get(&oper.index()).unwrap();
-                        if let Ok(task) = oper.recv(*rx){
+                        if let Ok(task) = oper.recv(*rx) {
                             let index = task.0.index.load(Ordering::SeqCst);
                             unsafe { poll_with_timer(task, index) };
                         }
@@ -134,6 +158,10 @@ impl ThreadPool {
                 .unwrap();
         }
     }
+
+    pub fn new_from_config( f: Arc<dyn Fn() + Send + Sync + 'static>) -> ThreadPool{
+        ThreadPool::new(CONFIG.num_thread,f)
+    }
 }
 
 unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
@@ -169,7 +197,7 @@ impl AdaptiveSpawn for ThreadPool {
 
 impl Default for ThreadPool {
     fn default() -> ThreadPool {
-        ThreadPool::new(num_cpus::get_physical(),Arc::new(||{}))
+        ThreadPool::new(num_cpus::get_physical(), Arc::new(|| {}))
     }
 }
 

@@ -1,0 +1,4 @@
+num_thread = 4
+swap_interval = 20
+queue_privilige = [ 512, 1, 1 ]
+time_feedback = [ 1000, 30000, 100000 ]

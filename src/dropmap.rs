@@ -6,7 +6,7 @@ use std::time::Duration;
 use chashmap::{CHashMap, ReadGuard};
 
 // swap interval (in secs)
-const SWAP_INTERVAL: u64 = 20;
+// const SWAP_INTERVAL: u64 = 20;
 
 struct MapPointer<K, V>
 where
@@ -55,14 +55,14 @@ where
     K: std::cmp::PartialEq + std::hash::Hash + Clone + 'static,
     V: 'static,
 {
-    pub fn new() -> Self {
+    pub fn new(swap_interval: u64) -> Self {
         let new = Arc::new(MapPointer::new());
         let old = Arc::new(MapPointer::new());
         let new_cpy = new.clone();
         let old_cpy = old.clone();
         thread::spawn(move || loop {
             unsafe {
-                thread::sleep(Duration::from_secs(SWAP_INTERVAL));
+                thread::sleep(Duration::from_secs(swap_interval));
                 let old_ptr = old_cpy.inner.swap(new_cpy.inner.load(SeqCst), SeqCst);
                 (*old_ptr).clear();
                 new_cpy.inner.store(old_ptr, SeqCst);
