@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use std::fs::read_to_string;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dropmap::DropMap;
 
@@ -29,6 +29,7 @@ struct Config {
     swap_interval: u64,
     queue_privilige: Vec<u64>,
     time_feedback: Vec<u64>,
+    percentage: u64,
 }
 
 lazy_static! {
@@ -38,25 +39,31 @@ lazy_static! {
         toml::from_str(&content).unwrap()
     };
     // take how many tasks from a queue in one term
-    static ref QUEUE_PRIVILIAGE:&'static[u64] = &CONFIG.queue_privilige;
+    static ref QUEUE_PRIVILEGE:&'static[u64] = &CONFIG.queue_privilige;
+    static ref FIRST_PRIVILEGE: AtomicU64 = AtomicU64::new(QUEUE_PRIVILEGE[0]);
     // the longest executed time a queue can hold (in micros)
     static ref TIME_FEEDBACK:&'static[u64] = &CONFIG.time_feedback;
+    // SMALL_TASK_CNT/HUGE_TASK_CNT should equal to PERCENTAGE
+    static ref PERCENTAGE: u64 = {
+        if CONFIG.percentage > 90{
+            panic!("percentage greater than 90%");
+        }
+        CONFIG.percentage
+        };
+    static ref SMALL_TASK_CNT: AtomicU64 = AtomicU64::new(0);
+    static ref HUGE_TASK_CNT: AtomicU64 = AtomicU64::new(0);
+    static ref MIN_PRI : u64 = 4;
+    static ref MAX_PRI : u64 = 4096 / CONFIG.num_thread as u64;
 }
 
-// take how many tasks from a queue in one term
-// const QUEUE_PRIVILIAGE: &'static [u64] = &[512, 8, 1];
-// the longest executed time a queue can hold (in micros)
-// const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
-
 // external upper level tester
-use adaptive_spawn::{AdaptiveSpawn,Options};
+use adaptive_spawn::{AdaptiveSpawn, Options};
 
 #[derive(Clone)]
 pub struct ThreadPool {
     // first priority, thread independent task queues
     first_queues: Vec<Sender<ArcTask>>,
     // other shared queues
-    // queues: Vec<Arc<TaskQueue>>,
     queues: Arc<[Sender<ArcTask>]>,
     // stats: token -> (executed_time(in micros),queue_index)
     stats: DropMap<u64, (Arc<AtomicU64>, Arc<AtomicUsize>)>,
@@ -69,16 +76,15 @@ impl ThreadPool {
         let mut queues = Vec::new();
         let mut rxs = Vec::new();
         let mut first_queues = Vec::new();
-        for _ in QUEUE_PRIVILIAGE.into_iter() {
+        for _ in QUEUE_PRIVILEGE.into_iter() {
             let (tx, rx) = channel::unbounded();
-            // let queue = Arc::new(TaskQueue { tx, rx });
             queues.push(tx);
             rxs.push(rx);
         }
         // create stats
         let stats = DropMap::new(CONFIG.swap_interval);
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
-        // spawn threads
+        // spawn worker threads
         for _ in 0..num_threads {
             let (tx, rx) = channel::unbounded();
             first_queues.push(tx.clone());
@@ -96,23 +102,65 @@ impl ThreadPool {
                 }
                 loop {
                     let mut is_empty = true;
-                    for ((rx, &limit), index) in rxs.iter().zip(QUEUE_PRIVILIAGE.into_iter()).zip(0..) {
-                        for task in rx.try_iter().take(limit as usize) {
-                            is_empty = false;
-                            unsafe { poll_with_timer(task, index) };
+                    for ((rx, &limit), index) in
+                        rxs.iter().zip(QUEUE_PRIVILEGE.into_iter()).zip(0..)
+                    {
+                        if index == 0 {
+                            for task in rx.try_iter().take(FIRST_PRIVILEGE.load(SeqCst) as usize) {
+                                is_empty = false;
+                                unsafe { poll_with_timer(task, index) };
+                            }
+                        } else {
+                            for task in rx.try_iter().take(limit as usize) {
+                                is_empty = false;
+                                unsafe { poll_with_timer(task, index) };
+                            }
                         }
                     }
                     if is_empty {
                         let oper = sel.select();
                         let rx = rx_map.get(&oper.index()).unwrap();
                         if let Ok(task) = oper.recv(*rx) {
-                            let index = task.0.index.load(Ordering::SeqCst);
+                            let index = task.0.index.load(SeqCst);
                             unsafe { poll_with_timer(task, index) };
                         }
                     }
                 }
             });
         }
+        // spawn adjustor thread
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let small = SMALL_TASK_CNT.load(SeqCst);
+                let huge = HUGE_TASK_CNT.load(SeqCst);
+                if (small + huge) == 0 {
+                    continue;
+                }
+                let cur_perc: u64 = small * 100 / (small + huge);
+                let first_privilege = FIRST_PRIVILEGE.load(SeqCst);
+                // println!("{}  {} -> {}\t{}", a, b, cur_perc, first_privilege);
+                // need to decrease first priority
+                if cur_perc > *PERCENTAGE + 5 {
+                    let mut new_pri = first_privilege / 2;
+                    if new_pri < *MIN_PRI {
+                        new_pri = *MIN_PRI;
+                    }
+                    FIRST_PRIVILEGE.store(new_pri, SeqCst);
+                }
+                // need to increase first priority
+                else if cur_perc < *PERCENTAGE - 5 {
+                    let mut new_pri = first_privilege * 2;
+                    if new_pri > *MAX_PRI {
+                        new_pri = *MAX_PRI;
+                    }
+                    FIRST_PRIVILEGE.store(new_pri, SeqCst);
+                }
+                // reset counter
+                SMALL_TASK_CNT.store(0, SeqCst);
+                HUGE_TASK_CNT.store(0, SeqCst);
+            }
+        });
         ThreadPool {
             first_queues,
             queues,
@@ -133,9 +181,9 @@ impl ThreadPool {
         }
         // otherwise use its own priority
         let (atom_elapsed, atom_index) = &*self.stats.get(&token).unwrap();
-        let index = atom_index.load(Ordering::SeqCst);
+        let index = atom_index.load(SeqCst);
         if index == 0 {
-            let thd_idx = self.first_queue_iter.fetch_add(1, Ordering::SeqCst) % self.num_threads;
+            let thd_idx = self.first_queue_iter.fetch_add(1, SeqCst) % self.num_threads;
             let sender = &self.first_queues[thd_idx];
             sender
                 .send(ArcTask::new(
@@ -162,24 +210,22 @@ impl ThreadPool {
         }
     }
 
-    pub fn new_from_config( f: Arc<dyn Fn() + Send + Sync + 'static>) -> ThreadPool{
-        ThreadPool::new(CONFIG.num_thread,f)
+    pub fn new_from_config(f: Arc<dyn Fn() + Send + Sync + 'static>) -> ThreadPool {
+        ThreadPool::new(CONFIG.num_thread, f)
     }
 }
 
 unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     let task_elapsed = task.0.elapsed.clone();
     // adjust queue level
-    let mut index = task.0.index.load(Ordering::SeqCst);
+    let mut index = task.0.index.load(SeqCst);
     if incoming_index != index {
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
-    if task_elapsed.load(Ordering::SeqCst) > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1
-    {
-        eprintln!("{} , {}",task.0.token,index + 1);
+    if task_elapsed.load(SeqCst) > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1 {
         index += 1;
-        task.0.index.store(index, Ordering::SeqCst);
+        task.0.index.store(index, SeqCst);
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
@@ -187,7 +233,12 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     let begin = Instant::now();
     task.poll();
     let elapsed = begin.elapsed().as_micros() as u64;
-    task_elapsed.fetch_add(elapsed, Ordering::SeqCst);
+    if incoming_index == 0 {
+        SMALL_TASK_CNT.fetch_add(elapsed, SeqCst);
+    } else {
+        HUGE_TASK_CNT.fetch_add(elapsed, SeqCst);
+    }
+    task_elapsed.fetch_add(elapsed, SeqCst);
 }
 
 impl AdaptiveSpawn for ThreadPool {
@@ -214,7 +265,7 @@ struct Task {
     index: Arc<AtomicUsize>,
     // this token's total epalsed time
     elapsed: Arc<AtomicU64>,
-    token: u64,
+    _token: u64,
 }
 
 #[derive(Clone)]
@@ -247,28 +298,27 @@ impl ArcTask {
             status: AtomicU8::new(WAITING),
             index,
             elapsed,
-            token
+            _token: token,
         });
         let future: *const Task = Arc::into_raw(future) as *const Task;
         unsafe { task(future) }
     }
 
     unsafe fn poll(self) {
-        self.0.status.store(POLLING, Ordering::SeqCst);
+        self.0.status.store(POLLING, SeqCst);
         let waker = ManuallyDrop::new(waker(&*self.0));
         let mut cx = Context::from_waker(&waker);
         loop {
             if let Poll::Ready(_) = (&mut *self.0.task.get()).poll_unpin(&mut cx) {
-                break self.0.status.store(COMPLETE, Ordering::SeqCst);
+                break self.0.status.store(COMPLETE, SeqCst);
             }
-            match self.0.status.compare_exchange(
-                POLLING,
-                WAITING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .0
+                .status
+                .compare_exchange(POLLING, WAITING, SeqCst, SeqCst)
+            {
                 Ok(_) => break,
-                Err(_) => self.0.status.store(POLLING, Ordering::SeqCst),
+                Err(_) => self.0.status.store(POLLING, SeqCst),
             }
         }
     }
@@ -295,18 +345,17 @@ unsafe fn drop_raw(this: *const ()) {
 
 unsafe fn wake_raw(this: *const ()) {
     let task = task(this as *const Task);
-    let mut status = task.0.status.load(Ordering::SeqCst);
+    let mut status = task.0.status.load(SeqCst);
     loop {
         match status {
             WAITING => {
-                match task.0.status.compare_exchange(
-                    WAITING,
-                    POLLING,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
+                match task
+                    .0
+                    .status
+                    .compare_exchange(WAITING, POLLING, SeqCst, SeqCst)
+                {
                     Ok(_) => {
-                        let index = task.0.index.load(Ordering::SeqCst);
+                        let index = task.0.index.load(SeqCst);
                         let sender = if index == 0 {
                             &task.0.local_queue
                         } else {
@@ -319,12 +368,11 @@ unsafe fn wake_raw(this: *const ()) {
                 }
             }
             POLLING => {
-                match task.0.status.compare_exchange(
-                    POLLING,
-                    REPOLL,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
+                match task
+                    .0
+                    .status
+                    .compare_exchange(POLLING, REPOLL, SeqCst, SeqCst)
+                {
                     Ok(_) => break,
                     Err(cur) => status = cur,
                 }
@@ -336,18 +384,17 @@ unsafe fn wake_raw(this: *const ()) {
 
 unsafe fn wake_ref_raw(this: *const ()) {
     let task = ManuallyDrop::new(task(this as *const Task));
-    let mut status = task.0.status.load(Ordering::SeqCst);
+    let mut status = task.0.status.load(SeqCst);
     loop {
         match status {
             WAITING => {
-                match task.0.status.compare_exchange(
-                    WAITING,
-                    POLLING,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
+                match task
+                    .0
+                    .status
+                    .compare_exchange(WAITING, POLLING, SeqCst, SeqCst)
+                {
                     Ok(_) => {
-                        let index = task.0.index.load(Ordering::SeqCst);
+                        let index = task.0.index.load(SeqCst);
                         let sender = if index == 0 {
                             &task.0.local_queue
                         } else {
@@ -360,12 +407,11 @@ unsafe fn wake_ref_raw(this: *const ()) {
                 }
             }
             POLLING => {
-                match task.0.status.compare_exchange(
-                    POLLING,
-                    REPOLL,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
+                match task
+                    .0
+                    .status
+                    .compare_exchange(POLLING, REPOLL, SeqCst, SeqCst)
+                {
                     Ok(_) => break,
                     Err(cur) => status = cur,
                 }
