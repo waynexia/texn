@@ -17,11 +17,11 @@ use std::thread;
 use std::time::Instant;
 
 // take how many tasks from a queue in one term
-const QUEUE_PRIVILIAGE: &'static [u64] = &[1024, 1, 1, 1, 1];
+const QUEUE_PRIVILIAGE: &'static [u64] = &[1024, 1, 1];
 // the longest executed time a queue can hold (in micros)
-const TIME_FEEDBACK: &'static [u64] = &[1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
 // the most appear times a queue can hold
-const CNT_FEEDBACK: &'static [u64] = &[5, 10, 15, 20, 25];
+const CNT_FEEDBACK: &'static [u64] = &[5, 10, 15];
 
 use adaptive_spawn::*;
 
@@ -89,9 +89,9 @@ impl ThreadPool {
         }
         // otherwise use its own priority
         let (cnt, _, mut index) = *self.stats.get(&token).unwrap();
-        if cnt > CNT_FEEDBACK[index] && index < CNT_FEEDBACK.len() - 1 {
-            index += 1;
-        }
+        // if cnt > CNT_FEEDBACK[index] && index < CNT_FEEDBACK.len() - 1 {
+        //     index += 1;
+        // }
         self.stats.upsert(
             token,
             || panic!(),
