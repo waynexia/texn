@@ -1,0 +1,15 @@
+[package]
+name = "texn"
+version = "0.1.0"
+authors = ["Ruihang Xia <waynestxia@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+crossbeam  = "0.7.2"
+num_cpus = "1.10.1"
+chashmap = "2.2.2"
+futures-preview = "0.3.0-alpha.17"
+
+adaptive-spawn = { path = "../adaptive-spawn" }
