@@ -30,10 +30,6 @@ const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
 // external upper level tester
 use adaptive_spawn::*;
 
-// fn foo() -> ! {
-//     panic!()
-// }
-
 #[derive(Clone)]
 pub struct ThreadPool {
     // first priority, thread independent task queues
@@ -48,7 +44,8 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
-    pub fn new(num_threads: usize) -> ThreadPool {
+    pub fn new<F>(num_threads: usize,f: F) -> ThreadPool
+    where  F: Fn() + Send + Sync + 'static,{
         let mut queues = Vec::new();
         let mut rxs = Vec::new();
         let mut first_queues = Vec::new();
@@ -61,6 +58,7 @@ impl ThreadPool {
         // create stats
         let stats = DropMap::new();
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
+        let f = Arc::new(f);
         // spawn threads
         for _ in 0..num_threads {
             let (tx, rx) = channel::unbounded();
@@ -68,7 +66,9 @@ impl ThreadPool {
             let mut rxs = rxs.clone();
             rxs.push(rx);
             rxs.swap_remove(0);
+            let f = f.clone();
             thread::spawn(move || {
+                f();
                 let mut sel = Select::new();
                 let mut rx_map = HashMap::new();
                 for rx in &rxs {
@@ -181,7 +181,7 @@ impl AdaptiveSpawn for ThreadPool {
 
 impl Default for ThreadPool {
     fn default() -> ThreadPool {
-        ThreadPool::new(num_cpus::get_physical())
+        ThreadPool::new(num_cpus::get_physical(),||{})
     }
 }
 
