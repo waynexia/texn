@@ -63,19 +63,9 @@ where
         thread::spawn(move || loop {
             unsafe {
                 thread::sleep(Duration::from_secs(SWAP_INTERVAL));
-                println!(
-                    "{} {}",
-                    (*old_cpy.inner.load(SeqCst)).len(),
-                    (*new_cpy.inner.load(SeqCst)).len()
-                );
                 let old_ptr = old_cpy.inner.swap(new_cpy.inner.load(SeqCst), SeqCst);
                 (*old_ptr).clear();
                 new_cpy.inner.store(old_ptr, SeqCst);
-                println!(
-                    "{} {}",
-                    (*old_cpy.inner.load(SeqCst)).len(),
-                    (*new_cpy.inner.load(SeqCst)).len()
-                );
             }
         });
         DropMap { new, old }

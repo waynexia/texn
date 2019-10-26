@@ -22,10 +22,6 @@ mod dropmap;
 const QUEUE_PRIVILIAGE: &'static [u64] = &[512, 8, 1];
 // the longest executed time a queue can hold (in micros)
 const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
-// hashmap capacity
-// const MAX_ENTRY: usize = 100_000;
-// time to live of a hashmap entry (in seconds)
-// const TTL: u64 = 20;
 
 // external upper level tester
 use adaptive_spawn::*;
@@ -77,9 +73,6 @@ impl ThreadPool {
                     let mut is_empty = true;
                     for ((rx, &limit), index) in rxs.iter().zip(QUEUE_PRIVILIAGE).zip(0..) {
                         for task in rx.try_iter().take(limit as usize) {
-                            // if index == 0 {
-                            // println!("received some");
-                            // }
                             is_empty = false;
                             unsafe { poll_with_timer(task, index) };
                         }
@@ -87,9 +80,10 @@ impl ThreadPool {
                     if is_empty {
                         let oper = sel.select();
                         let rx = rx_map.get(&oper.index()).unwrap();
-                        let task = oper.recv(*rx).unwrap();
-                        let index = task.0.index.load(Ordering::SeqCst);
-                        unsafe { poll_with_timer(task, index) };
+                        if let Ok(task) = oper.recv(*rx){
+                            let index = task.0.index.load(Ordering::SeqCst);
+                            unsafe { poll_with_timer(task, index) };
+                        }
                     }
                 }
             });
@@ -116,10 +110,6 @@ impl ThreadPool {
         let (atom_elapsed, atom_index) = &*self.stats.get(&token).unwrap();
         let index = atom_index.load(Ordering::SeqCst);
         if index == 0 {
-            // println!(
-            //     "push into {}",
-            //     self.first_queue_iter.load(Ordering::SeqCst) % self.num_threads
-            // );
             let thd_idx = self.first_queue_iter.fetch_add(1, Ordering::SeqCst) % self.num_threads;
             let sender = &self.first_queues[thd_idx];
             sender
