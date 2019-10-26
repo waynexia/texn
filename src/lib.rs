@@ -3,27 +3,24 @@ use crossbeam::channel::Select;
 use crossbeam::{channel, Receiver, Sender};
 use futures::future::BoxFuture;
 use futures::prelude::*;
-use num_cpus;
 use lru_time_cache::LruCache;
+use num_cpus;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
 // use std::panic;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc,Mutex};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
-use std::time::{Instant,Duration};
+use std::time::{Duration, Instant};
 
 // take how many tasks from a queue in one term
 const QUEUE_PRIVILIAGE: &'static [u64] = &[1024, 1, 1];
 // the longest executed time a queue can hold (in micros)
 const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
-// the most appear times a queue can hold
-// const CNT_FEEDBACK: &'static [u64] = &[5, 10, 15];
-
 // hashmap capacity
 const MAX_ENTRY: usize = 100_000;
 // time to live of a hashmap entry (in seconds)
@@ -39,8 +36,8 @@ use adaptive_spawn::*;
 #[derive(Clone)]
 pub struct ThreadPool {
     queues: Vec<Arc<TaskQueue>>,
-    // stats: token -> (appear_times,executed_time(in micros),queue_index)
-    stats: Arc<Mutex<LruCache<u64, (u64, u64, usize)>>>,
+    // stats: token -> (executed_time(in micros),queue_index)
+    stats: Arc<Mutex<LruCache<u64, (Arc<AtomicU64>, usize)>>>,
 }
 
 impl ThreadPool {
@@ -58,7 +55,6 @@ impl ThreadPool {
         // spawn threads
         for _ in 0..num_threads {
             let queues = queues.clone();
-            let stats = stats_for_constructor.clone();
             thread::spawn(move || {
                 let mut sel = Select::new();
                 let mut rx_map = HashMap::new();
@@ -71,7 +67,7 @@ impl ThreadPool {
                     for ((queue, &limit), index) in queues.iter().zip(QUEUE_PRIVILIAGE).zip(0..) {
                         for task in queue.rx.try_iter().take(limit as usize) {
                             is_empty = false;
-                            unsafe { poll_with_timer(&stats, task, index) };
+                            unsafe { poll_with_timer(task, index) };
                         }
                     }
                     if is_empty {
@@ -79,7 +75,7 @@ impl ThreadPool {
                         let rx = rx_map.get(&oper.index()).unwrap();
                         let task = oper.recv(*rx).unwrap();
                         let index = task.0.index.load(Ordering::SeqCst);
-                        unsafe { poll_with_timer(&stats, task, index) };
+                        unsafe { poll_with_timer(task, index) };
                     }
                 }
             });
@@ -97,49 +93,39 @@ impl ThreadPool {
         let mut stats = self.stats.lock().unwrap();
         // at begin a token has top priority
         if !stats.contains_key(&token) {
-            stats.insert(token, (1, 0, 0));
+            stats.insert(token, (Arc::default(), 0));
         }
         // otherwise use its own priority
-        let (_, _, index) = *stats.get_mut(&token).unwrap();
-        let _ = self.queues[index]
-            .tx
-            .send(ArcTask::new(task, self.queues.clone(), token, index));
+        let (elapsed, index) = &*stats.get_mut(&token).unwrap();
+        let _ = self.queues[*index].tx.send(ArcTask::new(
+            task,
+            self.queues.clone(),
+            *index,
+            elapsed.clone(),
+        ));
     }
 }
 
-unsafe fn poll_with_timer(
-    stats_param: &Mutex<LruCache<u64, (u64, u64, usize)>>,
-    task: ArcTask,
-    incoming_index: usize,
-) {
-    let token = task.0.token;
-    let mut stats = stats_param.lock().unwrap();
+unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
+    let task_elapsed = task.0.elapsed.clone();
     // adjust queue level
-    let (_, elapsed, mut index) = *stats.get_mut(&token).unwrap();
+    let mut index = task.0.index.load(Ordering::SeqCst);
     if incoming_index != index {
         let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
         return;
     }
-    if elapsed > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1 {
+    if task_elapsed.load(Ordering::SeqCst) > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1
+    {
         index += 1;
         task.0.index.store(index, Ordering::SeqCst);
-        // stats.upsert(token, || panic!(), |(_, _, i, _)| *i = index);
-        let (_,_,i) = stats.get_mut(&token).unwrap();
-        *i = index;
         let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
         return;
     }
-    drop(stats);
     // polling
     let begin = Instant::now();
     task.poll();
     let elapsed = begin.elapsed().as_micros() as u64;
-    // update executed time
-    let mut stats = stats_param.lock().unwrap();
-    let (_,e,_) = stats.get_mut(&token).unwrap();
-    *e += elapsed;
-    drop(stats);
-    // stats.upsert(token, || panic!(), |(_, e, _, _)| *e += elapsed);
+    task_elapsed.fetch_add(elapsed, Ordering::SeqCst);
 }
 
 impl AdaptiveSpawn for ThreadPool {
@@ -166,9 +152,10 @@ struct Task {
     task: UnsafeCell<BoxFuture<'static, ()>>,
     queues: Vec<Arc<TaskQueue>>,
     status: AtomicU8,
-    token: u64,
-    // this token belongs to which queue
+    // this task belongs to which queue
     index: AtomicUsize,
+    // this token's total epalsed time
+    elapsed: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -183,7 +170,12 @@ unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
 impl ArcTask {
-    fn new<F>(future: F, queues: Vec<Arc<TaskQueue>>, token: u64, index: usize) -> ArcTask
+    fn new<F>(
+        future: F,
+        queues: Vec<Arc<TaskQueue>>,
+        index: usize,
+        elapsed: Arc<AtomicU64>,
+    ) -> ArcTask
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -191,8 +183,8 @@ impl ArcTask {
             task: UnsafeCell::new(future.boxed()),
             queues,
             status: AtomicU8::new(WAITING),
-            token,
             index: AtomicUsize::new(index),
+            elapsed,
         });
         let future: *const Task = Arc::into_raw(future) as *const Task;
         unsafe { task(future) }
