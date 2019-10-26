@@ -1,18 +1,21 @@
 use chashmap::CHashMap;
+use crossbeam::channel::{Select, TryRecvError};
 use crossbeam::{channel, Receiver, Sender};
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use num_cpus;
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
+use std::panic;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
 
-const QUEUE_PRIVILIAGE: &'static [u64] = &[1, 2, 4];
+const QUEUE_PRIVILIAGE: &'static [u64] = &[1, 5, 25];
 
 use adaptive_spawn::*;
 
@@ -37,18 +40,36 @@ impl ThreadPool {
         // let queues = Arc::new(queues);
         for _ in 0..num_threads {
             let queues = queues.clone();
-            thread::spawn(move || loop {
-                let mut index = 0;
+            thread::spawn(move || {
+                let mut sel = Select::new();
+                let mut rx_map = HashMap::new();
                 for queue in &queues {
-                    let mut exec_cnt = 0;
-                    while exec_cnt < QUEUE_PRIVILIAGE[index] {
-                        if let Ok(task) = queue.rx.recv() {
+                    let idx = sel.recv(&queue.rx);
+                    rx_map.insert(idx, &queue.rx);
+                }
+                loop {
+                    // let mut index = 0;
+                    let mut is_empty = true;
+                    for (queue, &limit) in queues.iter().zip(QUEUE_PRIVILIAGE) {
+                        for task in queue.rx.try_iter().take(limit as usize) {
+                            is_empty = false;
                             unsafe { task.poll() };
-                            exec_cnt += 1;
                         }
-                        exec_cnt += 1;
+                        // let mut exec_cnt = 0;
+                        // while exec_cnt < QUEUE_PRIVILIAGE[index] {
+                        //     if let Ok(task) = queue.rx.try_recv() {
+                        //         unsafe { task.poll() };
+                        //         exec_cnt += 1;
+                        //     }
+                        // }
+                        // index += 1;
                     }
-                    index += 1;
+                    if is_empty {
+                        let oper = sel.select();
+                        let rx = rx_map.get(&oper.index()).unwrap();
+                        let task = oper.recv(*rx).unwrap();
+                        unsafe { task.poll() };
+                    }
                 }
             });
         }
@@ -65,24 +86,22 @@ impl ThreadPool {
         if !self.stats.contains_key(&token) {
             self.stats.insert(token, 1);
         }
-        let mut index = 0;
-        while index < QUEUE_PRIVILIAGE.len()
-            && QUEUE_PRIVILIAGE[index] < *self.stats.get(&token).unwrap()
-        {
-            index += 1;
+        let mut index = QUEUE_PRIVILIAGE.len() - 1;
+        while index > 0 && QUEUE_PRIVILIAGE[index] < *self.stats.get(&token).unwrap() {
+            index -= 1;
         }
         self.stats.upsert(token, || panic!(), |v| *v += 1);
-        let queue = self.queues[index as usize].clone();
+        let queue = self.queues[index].clone();
         let _ = queue.tx.send(ArcTask::new(task, queue.clone()));
     }
 }
 
-impl AdaptiveSpawn for ThreadPool{
+impl AdaptiveSpawn for ThreadPool {
     fn spawn_opt<Fut>(&self, f: Fut, opt: Options)
     where
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.spawn(f,opt.token,opt.nice);
+        self.spawn(f, opt.token, opt.nice);
     }
 }
 
