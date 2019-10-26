@@ -34,6 +34,7 @@ struct Config {
 lazy_static! {
     static ref CONFIG: Config = {
         let content = read_to_string("/root/config.toml").unwrap();
+        // let content = read_to_string("/data/waynest/code/pingcap_hackathon2019/adaptive-thread-pool/texn/src/config.toml").unwrap();
         toml::from_str(&content).unwrap()
     };
     // take how many tasks from a queue in one term
@@ -141,8 +142,9 @@ impl ThreadPool {
                     task,
                     sender.clone(),
                     self.queues.clone(),
-                    index,
+                    atom_index.clone(),
                     atom_elapsed.clone(),
+                    token,
                 ))
                 .unwrap();
         } else {
@@ -152,8 +154,9 @@ impl ThreadPool {
                     // don't care
                     self.first_queues[0].clone(),
                     self.queues.clone(),
-                    index,
+                    atom_index.clone(),
                     atom_elapsed.clone(),
+                    token,
                 ))
                 .unwrap();
         }
@@ -174,6 +177,7 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     }
     if task_elapsed.load(Ordering::SeqCst) > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1
     {
+        eprintln!("{} , {}",task.0.token,index + 1);
         index += 1;
         task.0.index.store(index, Ordering::SeqCst);
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
@@ -207,9 +211,10 @@ struct Task {
     queues: Arc<[Sender<ArcTask>]>,
     status: AtomicU8,
     // this task belongs to which queue
-    index: AtomicUsize,
+    index: Arc<AtomicUsize>,
     // this token's total epalsed time
     elapsed: Arc<AtomicU64>,
+    token: u64,
 }
 
 #[derive(Clone)]
@@ -228,8 +233,9 @@ impl ArcTask {
         future: F,
         local_queue: Sender<ArcTask>,
         queues: Arc<[Sender<ArcTask>]>,
-        index: usize,
+        index: Arc<AtomicUsize>,
         elapsed: Arc<AtomicU64>,
+        token: u64,
     ) -> ArcTask
     where
         F: Future<Output = ()> + Send + 'static,
@@ -239,8 +245,9 @@ impl ArcTask {
             local_queue,
             queues,
             status: AtomicU8::new(WAITING),
-            index: AtomicUsize::new(index),
+            index,
             elapsed,
+            token
         });
         let future: *const Task = Arc::into_raw(future) as *const Task;
         unsafe { task(future) }
