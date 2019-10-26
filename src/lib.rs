@@ -1,33 +1,35 @@
-use chashmap::CHashMap;
+// use chashmap::CHashMap;
 use crossbeam::channel::Select;
 use crossbeam::{channel, Receiver, Sender};
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use num_cpus;
+use lru_time_cache::LruCache;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
-use std::panic;
+// use std::panic;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc,Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant,Duration};
 
 // take how many tasks from a queue in one term
 const QUEUE_PRIVILIAGE: &'static [u64] = &[1024, 1, 1];
 // the longest executed time a queue can hold (in micros)
 const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
 // the most appear times a queue can hold
-const CNT_FEEDBACK: &'static [u64] = &[5, 10, 15];
+// const CNT_FEEDBACK: &'static [u64] = &[5, 10, 15];
 
 // hashmap capacity
 const MAX_ENTRY: usize = 100_000;
 // time to live of a hashmap entry (in seconds)
-const TTL: u64 = 60;
+const TTL: u64 = 20;
 
+// external upper level tester
 use adaptive_spawn::*;
 
 // fn foo() -> ! {
@@ -38,7 +40,7 @@ use adaptive_spawn::*;
 pub struct ThreadPool {
     queues: Vec<Arc<TaskQueue>>,
     // stats: token -> (appear_times,executed_time(in micros),queue_index)
-    stats: Arc<CHashMap<u64, (u64, u64, usize, Instant)>>,
+    stats: Arc<Mutex<LruCache<u64, (u64, u64, usize)>>>,
 }
 
 impl ThreadPool {
@@ -49,7 +51,11 @@ impl ThreadPool {
             let queue = Arc::new(TaskQueue { tx, rx });
             queues.push(queue);
         }
-        let stats_for_constructor = Arc::new(CHashMap::new());
+        // create stats
+        let ttl = Duration::from_secs(TTL);
+        let stats_for_constructor = LruCache::with_expiry_duration_and_capacity(ttl, MAX_ENTRY);
+        let stats_for_constructor = Arc::new(Mutex::new(stats_for_constructor));
+        // spawn threads
         for _ in 0..num_threads {
             let queues = queues.clone();
             let stats = stats_for_constructor.clone();
@@ -88,43 +94,28 @@ impl ThreadPool {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // clear old entry
-        if self.stats.len() > MAX_ENTRY {
-            self.stats
-                .retain(|_, (_, _, _, start_time)| start_time.elapsed().as_secs() <= TTL);
-        }
+        let mut stats = self.stats.lock().unwrap();
         // at begin a token has top priority
-        if !self.stats.contains_key(&token) {
-            self.stats.insert(token, (1, 0, 0, Instant::now()));
+        if !stats.contains_key(&token) {
+            stats.insert(token, (1, 0, 0));
         }
         // otherwise use its own priority
-        let (cnt, _, mut index, _) = *self.stats.get(&token).unwrap();
-        // if cnt > CNT_FEEDBACK[index] && index < CNT_FEEDBACK.len() - 1 {
-        //     index += 1;
-        // }
-        self.stats.upsert(
-            token,
-            || panic!(),
-            |(c, _, i, _)| {
-                *c += 1;
-                *i = index
-            },
-        );
+        let (_, _, index) = *stats.get_mut(&token).unwrap();
         let _ = self.queues[index]
             .tx
             .send(ArcTask::new(task, self.queues.clone(), token, index));
-        // println!("{:?}", self.stats);
     }
 }
 
 unsafe fn poll_with_timer(
-    stats: &CHashMap<u64, (u64, u64, usize, Instant)>,
+    stats_param: &Mutex<LruCache<u64, (u64, u64, usize)>>,
     task: ArcTask,
     incoming_index: usize,
 ) {
     let token = task.0.token;
+    let mut stats = stats_param.lock().unwrap();
     // adjust queue level
-    let (_, elapsed, mut index, _) = *stats.get(&token).unwrap();
+    let (_, elapsed, mut index) = *stats.get_mut(&token).unwrap();
     if incoming_index != index {
         let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
         return;
@@ -132,15 +123,23 @@ unsafe fn poll_with_timer(
     if elapsed > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1 {
         index += 1;
         task.0.index.store(index, Ordering::SeqCst);
-        stats.upsert(token, || panic!(), |(_, _, i, _)| *i = index);
+        // stats.upsert(token, || panic!(), |(_, _, i, _)| *i = index);
+        let (_,_,i) = stats.get_mut(&token).unwrap();
+        *i = index;
         let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
         return;
     }
+    drop(stats);
     // polling
     let begin = Instant::now();
     task.poll();
     let elapsed = begin.elapsed().as_micros() as u64;
-    stats.upsert(token, || panic!(), |(_, e, _, _)| *e += elapsed);
+    // update executed time
+    let mut stats = stats_param.lock().unwrap();
+    let (_,e,_) = stats.get_mut(&token).unwrap();
+    *e += elapsed;
+    drop(stats);
+    // stats.upsert(token, || panic!(), |(_, e, _, _)| *e += elapsed);
 }
 
 impl AdaptiveSpawn for ThreadPool {
@@ -154,7 +153,7 @@ impl AdaptiveSpawn for ThreadPool {
 
 impl Default for ThreadPool {
     fn default() -> ThreadPool {
-        ThreadPool::new(num_cpus::get())
+        ThreadPool::new(num_cpus::get_physical())
     }
 }
 
