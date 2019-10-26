@@ -17,8 +17,10 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// mod dropmap;
+
 // take how many tasks from a queue in one term
-const QUEUE_PRIVILIAGE: &'static [u64] = &[1024, 1, 1];
+const QUEUE_PRIVILIAGE: &'static [u64] = &[256, 1, 1];
 // the longest executed time a queue can hold (in micros)
 const TIME_FEEDBACK: &'static [u64] = &[1_000, 30_000, 1_000_000];
 // hashmap capacity
@@ -35,37 +37,54 @@ use adaptive_spawn::*;
 
 #[derive(Clone)]
 pub struct ThreadPool {
-    queues: Vec<Arc<TaskQueue>>,
+    // first priority, thread independent task queues
+    first_queues: Vec<Sender<ArcTask>>,
+    // other shared queues
+    // queues: Vec<Arc<TaskQueue>>,
+    queues: Arc<[Sender<ArcTask>]>,
     // stats: token -> (executed_time(in micros),queue_index)
     stats: Arc<Mutex<LruCache<u64, (Arc<AtomicU64>, usize)>>>,
+    num_threads: usize,
+    first_queue_iter: Arc<AtomicUsize>,
 }
 
 impl ThreadPool {
     pub fn new(num_threads: usize) -> ThreadPool {
         let mut queues = Vec::new();
+        let mut rxs = Vec::new();
+        let mut first_queues = Vec::new();
         for _ in QUEUE_PRIVILIAGE {
             let (tx, rx) = channel::unbounded();
-            let queue = Arc::new(TaskQueue { tx, rx });
-            queues.push(queue);
+            // let queue = Arc::new(TaskQueue { tx, rx });
+            queues.push(tx);
+            rxs.push(rx);
         }
         // create stats
         let ttl = Duration::from_secs(TTL);
         let stats_for_constructor = LruCache::with_expiry_duration_and_capacity(ttl, MAX_ENTRY);
         let stats_for_constructor = Arc::new(Mutex::new(stats_for_constructor));
+        let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
         // spawn threads
         for _ in 0..num_threads {
-            let queues = queues.clone();
+            let (tx, rx) = channel::unbounded();
+            first_queues.push(tx.clone());
+            let mut rxs = rxs.clone();
+            rxs.push(rx);
+            rxs.swap_remove(0);
             thread::spawn(move || {
                 let mut sel = Select::new();
                 let mut rx_map = HashMap::new();
-                for queue in &queues {
-                    let idx = sel.recv(&queue.rx);
-                    rx_map.insert(idx, &queue.rx);
+                for rx in &rxs {
+                    let idx = sel.recv(rx);
+                    rx_map.insert(idx, rx);
                 }
                 loop {
                     let mut is_empty = true;
-                    for ((queue, &limit), index) in queues.iter().zip(QUEUE_PRIVILIAGE).zip(0..) {
-                        for task in queue.rx.try_iter().take(limit as usize) {
+                    for ((rx, &limit), index) in rxs.iter().zip(QUEUE_PRIVILIAGE).zip(0..) {
+                        for task in rx.try_iter().take(limit as usize) {
+                            // if index == 0 {
+                            // println!("received some");
+                            // }
                             is_empty = false;
                             unsafe { poll_with_timer(task, index) };
                         }
@@ -81,8 +100,11 @@ impl ThreadPool {
             });
         }
         ThreadPool {
+            first_queues,
             queues,
             stats: stats_for_constructor,
+            num_threads,
+            first_queue_iter: Arc::default(),
         }
     }
 
@@ -97,12 +119,34 @@ impl ThreadPool {
         }
         // otherwise use its own priority
         let (elapsed, index) = &*stats.get_mut(&token).unwrap();
-        let _ = self.queues[*index].tx.send(ArcTask::new(
-            task,
-            self.queues.clone(),
-            *index,
-            elapsed.clone(),
-        ));
+        if index == &0 {
+            // println!(
+            //     "push into {}",
+            //     self.first_queue_iter.load(Ordering::SeqCst) % self.num_threads
+            // );
+            let thd_idx = self.first_queue_iter.fetch_add(1, Ordering::SeqCst) % self.num_threads;
+            let sender = &self.first_queues[thd_idx];
+            sender
+                .send(ArcTask::new(
+                    task,
+                    sender.clone(),
+                    self.queues.clone(),
+                    *index,
+                    elapsed.clone(),
+                ))
+                .unwrap();
+        } else {
+            self.queues[*index]
+                .send(ArcTask::new(
+                    task,
+                    // don't care
+                    self.first_queues[0].clone(),
+                    self.queues.clone(),
+                    *index,
+                    elapsed.clone(),
+                ))
+                .unwrap();
+        }
     }
 }
 
@@ -111,14 +155,14 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     // adjust queue level
     let mut index = task.0.index.load(Ordering::SeqCst);
     if incoming_index != index {
-        let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
+        task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
     if task_elapsed.load(Ordering::SeqCst) > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1
     {
         index += 1;
         task.0.index.store(index, Ordering::SeqCst);
-        let _ = task.0.queues[index].tx.send(clone_task(&*task.0));
+        task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
     // polling
@@ -150,7 +194,8 @@ struct TaskQueue {
 
 struct Task {
     task: UnsafeCell<BoxFuture<'static, ()>>,
-    queues: Vec<Arc<TaskQueue>>,
+    local_queue: Sender<ArcTask>,
+    queues: Arc<[Sender<ArcTask>]>,
     status: AtomicU8,
     // this task belongs to which queue
     index: AtomicUsize,
@@ -172,7 +217,8 @@ unsafe impl Sync for Task {}
 impl ArcTask {
     fn new<F>(
         future: F,
-        queues: Vec<Arc<TaskQueue>>,
+        local_queue: Sender<ArcTask>,
+        queues: Arc<[Sender<ArcTask>]>,
         index: usize,
         elapsed: Arc<AtomicU64>,
     ) -> ArcTask
@@ -181,6 +227,7 @@ impl ArcTask {
     {
         let future = Arc::new(Task {
             task: UnsafeCell::new(future.boxed()),
+            local_queue,
             queues,
             status: AtomicU8::new(WAITING),
             index: AtomicUsize::new(index),
@@ -243,10 +290,13 @@ unsafe fn wake_raw(this: *const ()) {
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        task.0.queues[task.0.index.load(Ordering::SeqCst)]
-                            .tx
-                            .send(clone_task(&*task.0))
-                            .unwrap();
+                        let index = task.0.index.load(Ordering::SeqCst);
+                        let sender = if index == 0 {
+                            &task.0.local_queue
+                        } else {
+                            &task.0.queues[index]
+                        };
+                        sender.send(clone_task(&*task.0)).unwrap();
                         break;
                     }
                     Err(cur) => status = cur,
@@ -281,10 +331,13 @@ unsafe fn wake_ref_raw(this: *const ()) {
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        task.0.queues[task.0.index.load(Ordering::SeqCst)]
-                            .tx
-                            .send(clone_task(&*task.0))
-                            .unwrap();
+                        let index = task.0.index.load(Ordering::SeqCst);
+                        let sender = if index == 0 {
+                            &task.0.local_queue
+                        } else {
+                            &task.0.queues[index]
+                        };
+                        sender.send(clone_task(&*task.0)).unwrap();
                         break;
                     }
                     Err(cur) => status = cur,
