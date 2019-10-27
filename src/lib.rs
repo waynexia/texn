@@ -34,8 +34,8 @@ struct Config {
 
 lazy_static! {
     static ref CONFIG: Config = {
-        let content = read_to_string("/root/config.toml").unwrap();
-        // let content = read_to_string("/data/waynest/code/pingcap_hackathon2019/adaptive-thread-pool/texn/src/config.toml").unwrap();
+        // let content = read_to_string("/root/config.toml").unwrap();
+        let content = read_to_string("/data/waynest/code/pingcap_hackathon2019/adaptive-thread-pool/texn/src/config.toml").unwrap();
         toml::from_str(&content).unwrap()
     };
     // take how many tasks from a queue in one term
@@ -170,7 +170,7 @@ impl ThreadPool {
         }
     }
 
-    pub fn spawn<F>(&self, task: F, token: u64, _nice: u8)
+    pub fn spawn<F>(&self, task: F, token: u64, nice: u8)
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -182,7 +182,7 @@ impl ThreadPool {
         // otherwise use its own priority
         let (atom_elapsed, atom_index) = &*self.stats.get(&token).unwrap();
         let index = atom_index.load(SeqCst);
-        if index == 0 {
+        if index == 0 || nice == 0 {
             let thd_idx = self.first_queue_iter.fetch_add(1, SeqCst) % self.num_threads;
             let sender = &self.first_queues[thd_idx];
             sender
@@ -192,6 +192,7 @@ impl ThreadPool {
                     self.queues.clone(),
                     atom_index.clone(),
                     atom_elapsed.clone(),
+                    nice,
                     token,
                 ))
                 .unwrap();
@@ -204,6 +205,7 @@ impl ThreadPool {
                     self.queues.clone(),
                     atom_index.clone(),
                     atom_elapsed.clone(),
+                    nice,
                     token,
                 ))
                 .unwrap();
@@ -223,7 +225,10 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
-    if task_elapsed.load(SeqCst) > TIME_FEEDBACK[index] && index < TIME_FEEDBACK.len() - 1 {
+    if task_elapsed.load(SeqCst) > TIME_FEEDBACK[index]
+        && index < TIME_FEEDBACK.len() - 1
+        && task.0.nice != 0
+    {
         index += 1;
         task.0.index.store(index, SeqCst);
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
@@ -265,6 +270,7 @@ struct Task {
     index: Arc<AtomicUsize>,
     // this token's total epalsed time
     elapsed: Arc<AtomicU64>,
+    nice: u8,
     _token: u64,
 }
 
@@ -286,6 +292,7 @@ impl ArcTask {
         queues: Arc<[Sender<ArcTask>]>,
         index: Arc<AtomicUsize>,
         elapsed: Arc<AtomicU64>,
+        nice: u8,
         token: u64,
     ) -> ArcTask
     where
@@ -298,6 +305,7 @@ impl ArcTask {
             status: AtomicU8::new(WAITING),
             index,
             elapsed,
+            nice,
             _token: token,
         });
         let future: *const Task = Arc::into_raw(future) as *const Task;
