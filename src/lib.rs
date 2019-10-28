@@ -34,9 +34,15 @@ struct Config {
 
 lazy_static! {
     static ref CONFIG: Config = {
+        Config {num_thread: num_cpus::get() - 2,
+        swap_interval: 20,
+        queue_privilige: vec![32, 4, 1],
+        time_feedback: vec![1000, 300_000, 10_000_000],
+        percentage: 80,
+        }
         // let content = read_to_string("/root/config.toml").unwrap();
-        let content = read_to_string("/data/waynest/code/pingcap_hackathon2019/adaptive-thread-pool/texn/src/config.toml").unwrap();
-        toml::from_str(&content).unwrap()
+        // let content = read_to_string("/data/waynest/code/pingcap_hackathon2019/adaptive-thread-pool/texn/src/config.toml").unwrap();
+        // toml::from_str(&content).unwrap()
     };
     // take how many tasks from a queue in one term
     static ref QUEUE_PRIVILEGE:&'static[u64] = &CONFIG.queue_privilige;
@@ -175,12 +181,9 @@ impl ThreadPool {
         F: Future<Output = ()> + Send + 'static,
     {
         // at begin a token has top priority
-        if !self.stats.contains_key(&token) {
-            self.stats
-                .insert_new(token, (Arc::default(), Arc::default()));
-        }
-        // otherwise use its own priority
-        let (atom_elapsed, atom_index) = &*self.stats.get(&token).unwrap();
+        let (atom_elapsed, atom_index) = &*self
+            .stats
+            .get_or_insert(&token, (Arc::default(), Arc::default()));
         let index = atom_index.load(SeqCst);
         if index == 0 || nice == 0 {
             let thd_idx = self.first_queue_iter.fetch_add(1, SeqCst) % self.num_threads;

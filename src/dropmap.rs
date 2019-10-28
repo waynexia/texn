@@ -4,25 +4,26 @@ use std::thread;
 use std::time::Duration;
 
 use chashmap::{CHashMap, ReadGuard};
+use dashmap::{DashMap, DashMapRef, DashMapRefAny};
 
 // swap interval (in secs)
 // const SWAP_INTERVAL: u64 = 20;
 
 struct MapPointer<K, V>
 where
-    K: std::cmp::PartialEq + std::hash::Hash + Clone + 'static,
+    K: std::cmp::Eq + std::hash::Hash + Clone + 'static,
     V: 'static,
 {
-    pub inner: AtomicPtr<CHashMap<K, V>>,
+    pub inner: AtomicPtr<DashMap<K, V>>,
 }
 
 impl<K, V> MapPointer<K, V>
 where
-    K: std::cmp::PartialEq + std::hash::Hash + Clone + 'static,
+    K: std::cmp::Eq + std::hash::Hash + Clone + 'static,
     V: 'static,
 {
     fn new() -> MapPointer<K, V> {
-        let map = Box::new(CHashMap::new());
+        let map = Box::new(DashMap::default());
         let inner = AtomicPtr::new(Box::into_raw(map));
         MapPointer { inner }
     }
@@ -30,12 +31,12 @@ where
 
 impl<K, V> Drop for MapPointer<K, V>
 where
-    K: std::cmp::PartialEq + std::hash::Hash + Clone + 'static,
+    K: std::cmp::Eq + std::hash::Hash + Clone + 'static,
     V: 'static,
 {
     fn drop(&mut self) {
         unsafe {
-            let _: CHashMap<K, V> = *self.inner.load(SeqCst);
+            let _: DashMap<K, V> = *self.inner.load(SeqCst);
         }
     }
 }
@@ -43,7 +44,7 @@ where
 #[derive(Clone)]
 pub struct DropMap<K, V>
 where
-    K: std::cmp::PartialEq + std::hash::Hash + Clone + 'static,
+    K: std::cmp::Eq + std::hash::Hash + Clone + 'static,
     V: 'static,
 {
     new: Arc<MapPointer<K, V>>,
@@ -52,7 +53,7 @@ where
 
 impl<K, V> DropMap<K, V>
 where
-    K: std::cmp::PartialEq + std::hash::Hash + Clone + 'static,
+    K: std::cmp::Eq + std::hash::Hash + Clone + 'static,
     V: 'static,
 {
     pub fn new(swap_interval: u64) -> Self {
@@ -77,7 +78,7 @@ where
                 true
             } else {
                 let old = self.old.inner.load(SeqCst);
-                if let Some(v) = (*old).remove(key) {
+                if let Some((_, v)) = (*old).remove(key) {
                     (*new).insert(key.clone(), v);
                     true
                 } else {
@@ -86,20 +87,20 @@ where
             }
         }
     }
-    pub fn insert_new(&self, key: K, value: V) {
+    pub fn get_or_insert(&self, key: &K, value: V) -> DashMapRefAny<'_, K, V> {
         unsafe {
             let new = self.new.inner.load(SeqCst);
-            (*new).insert_new(key, value);
+            (*new).get_or_insert(key, value)
         }
     }
-    pub fn get(&self, key: &K) -> Option<ReadGuard<K, V>> {
+    pub fn get(&self, key: &K) -> Option<DashMapRef<'_, K, V>> {
         unsafe {
             let new = &*self.new.inner.load(SeqCst);
             if let Some(v) = new.get(key) {
                 return Some(v);
             }
             let old = &*self.old.inner.load(SeqCst);
-            if let Some(v) = old.remove(key) {
+            if let Some((_, v)) = old.remove(key) {
                 new.insert(key.clone(), v);
                 return new.get(key);
             }
