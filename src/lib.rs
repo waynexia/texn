@@ -5,11 +5,9 @@ use futures::prelude::*;
 use lazy_static::lazy_static;
 use num_cpus;
 use serde::Deserialize;
-use toml;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::fs::read_to_string;
 use std::future::Future;
 use std::mem::{forget, ManuallyDrop};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::SeqCst};
@@ -34,7 +32,7 @@ struct Config {
 
 lazy_static! {
     static ref CONFIG: Config = {
-        Config {num_thread: num_cpus::get() - 2,
+        Config {num_thread: num_cpus::get_physical(),
         swap_interval: 20,
         queue_privilige: vec![32, 4, 1],
         time_feedback: vec![1000, 300_000, 10_000_000],

@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use chashmap::{CHashMap, ReadGuard};
-use dashmap::{DashMap, DashMapRef, DashMapRefAny};
+use dashmap::{DashMap, DashMapRefAny};
 
 // swap interval (in secs)
 // const SWAP_INTERVAL: u64 = 20;
@@ -71,40 +70,10 @@ where
         });
         DropMap { new, old }
     }
-    pub fn contains_key(&self, key: &K) -> bool {
-        unsafe {
-            let new = self.new.inner.load(SeqCst);
-            if (*new).contains_key(key) {
-                true
-            } else {
-                let old = self.old.inner.load(SeqCst);
-                if let Some((_, v)) = (*old).remove(key) {
-                    (*new).insert(key.clone(), v);
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
     pub fn get_or_insert(&self, key: &K, value: V) -> DashMapRefAny<'_, K, V> {
         unsafe {
             let new = self.new.inner.load(SeqCst);
             (*new).get_or_insert(key, value)
-        }
-    }
-    pub fn get(&self, key: &K) -> Option<DashMapRef<'_, K, V>> {
-        unsafe {
-            let new = &*self.new.inner.load(SeqCst);
-            if let Some(v) = new.get(key) {
-                return Some(v);
-            }
-            let old = &*self.old.inner.load(SeqCst);
-            if let Some((_, v)) = old.remove(key) {
-                new.insert(key.clone(), v);
-                return new.get(key);
-            }
-            None
         }
     }
 }
