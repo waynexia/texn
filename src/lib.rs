@@ -112,7 +112,7 @@ impl ThreadPool {
                     for ((rx, &limit), index) in
                         rxs.iter().zip(QUEUE_PRIVILEGE.into_iter()).zip(0..)
                     {
-                        if index == 0 {
+                        if unsafe { likely(index == 0) } {
                             for task in rx.try_iter().take(FIRST_PRIVILEGE.load(SeqCst) as usize) {
                                 is_empty = false;
                                 unsafe { poll_with_timer(task, index) };
@@ -124,7 +124,7 @@ impl ThreadPool {
                             }
                         }
                     }
-                    if is_empty {
+                    if unsafe { unlikely(is_empty) } {
                         let oper = sel.select();
                         let rx = rx_map.get(&oper.index()).unwrap();
                         if let Ok(task) = oper.recv(*rx) {
@@ -141,7 +141,7 @@ impl ThreadPool {
                 thread::sleep(Duration::from_secs(1));
                 let small = SMALL_TASK_CNT.load(SeqCst);
                 let huge = HUGE_TASK_CNT.load(SeqCst);
-                if (small + huge) == 0 {
+                if unsafe { unlikely((small + huge) == 0) } {
                     continue;
                 }
                 let cur_perc: u64 = small * 100 / (small + huge);
@@ -186,7 +186,7 @@ impl ThreadPool {
             .stats
             .get_or_insert(&token, (Arc::default(), Arc::default()));
         let index = atom_index.load(SeqCst);
-        if index == 0 || nice == 0 {
+        if unsafe { likely(index == 0 || nice == 0) } {
             let thd_idx = self.first_queue_iter.fetch_add(1, SeqCst) % self.num_threads;
             let sender = &self.first_queues[thd_idx];
             match sender.try_send(ArcTask::new(
@@ -228,11 +228,11 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     let task_elapsed = task.0.elapsed.clone();
     // adjust queue level
     let mut index = task.0.index.load(SeqCst);
-    if incoming_index < index {
+    if unlikely(incoming_index < index) {
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
-    if task_elapsed.load(SeqCst) > TIME_FEEDBACK[index]
+    if unlikely(task_elapsed.load(SeqCst) > TIME_FEEDBACK[index])
         && index < TIME_FEEDBACK.len() - 1
         && task.0.nice != 0
     {
@@ -245,11 +245,11 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     let begin = Instant::now();
     task.poll();
     let mut elapsed = begin.elapsed().as_micros() as u64;
-    if elapsed > 5 {
+    if unlikely(elapsed > 5) {
         elapsed = 5;
     }
 
-    if incoming_index == 0 {
+    if likely(incoming_index == 0) {
         SMALL_TASK_CNT.fetch_add(elapsed, SeqCst);
     } else {
         HUGE_TASK_CNT.fetch_add(elapsed, SeqCst);
