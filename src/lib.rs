@@ -50,18 +50,19 @@ lazy_static! {
     static ref FIRST_PRIVILEGE: AtomicU64 = AtomicU64::new(QUEUE_PRIVILEGE[0]);
     // the longest executed time a queue can hold (in micros)
     static ref TIME_FEEDBACK:&'static[u64] = &CONFIG.time_feedback;
-    // SMALL_TASK_CNT/HUGE_TASK_CNT should equal to PERCENTAGE
+    // SMALL_TASK_CNT/(SMALL_TASK_CNT + HUGE_TASK_CNT) should equal to PERCENTAGE
     static ref PERCENTAGE: u64 = {
         if CONFIG.percentage > 90{
             panic!("percentage greater than 90%");
         }
         CONFIG.percentage
         };
-    static ref SMALL_TASK_CNT: AtomicU64 = AtomicU64::new(0);
-    static ref HUGE_TASK_CNT: AtomicU64 = AtomicU64::new(0);
     static ref MIN_PRI : u64 = 4;
     static ref MAX_PRI : u64 = 4096 / CONFIG.num_thread as u64;
 }
+
+static mut SMALL_TASK_CNT: u64 = 0;
+static mut HUGE_TASK_CNT: u64 = 0;
 
 // external upper level tester
 use adaptive_spawn::{AdaptiveSpawn, Options};
@@ -139,8 +140,8 @@ impl ThreadPool {
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(1));
-                let small = SMALL_TASK_CNT.load(SeqCst);
-                let huge = HUGE_TASK_CNT.load(SeqCst);
+                let small = unsafe { SMALL_TASK_CNT };
+                let huge = unsafe { HUGE_TASK_CNT };
                 if unsafe { unlikely((small + huge) == 0) } {
                     continue;
                 }
@@ -164,8 +165,10 @@ impl ThreadPool {
                     FIRST_PRIVILEGE.store(new_pri, SeqCst);
                 }
                 // reset counter
-                SMALL_TASK_CNT.store(0, SeqCst);
-                HUGE_TASK_CNT.store(0, SeqCst);
+                unsafe {
+                    SMALL_TASK_CNT = 0;
+                    HUGE_TASK_CNT = 0;
+                }
             }
         });
         ThreadPool {
@@ -250,9 +253,9 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     }
 
     if likely(incoming_index == 0) {
-        SMALL_TASK_CNT.fetch_add(elapsed, SeqCst);
+        SMALL_TASK_CNT += elapsed;
     } else {
-        HUGE_TASK_CNT.fetch_add(elapsed, SeqCst);
+        HUGE_TASK_CNT += elapsed;
     }
     task_elapsed.fetch_add(elapsed, SeqCst);
 }
