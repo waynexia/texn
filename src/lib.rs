@@ -1,3 +1,5 @@
+#![feature(core_intrinsics)]
+
 use crossbeam::channel::Select;
 use crossbeam::{channel, Sender};
 use futures::future::BoxFuture;
@@ -9,6 +11,7 @@ use serde::Deserialize;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::intrinsics::{likely, unlikely};
 use std::mem::{forget, ManuallyDrop};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
@@ -90,7 +93,7 @@ impl ThreadPool {
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
         // spawn worker threads
         for _ in 0..num_threads {
-            let (tx, rx) = channel::unbounded();
+            let (tx, rx) = channel::bounded(4096);
             first_queues.push(tx.clone());
             let mut rxs = rxs.clone();
             rxs.push(rx);
@@ -186,17 +189,20 @@ impl ThreadPool {
         if index == 0 || nice == 0 {
             let thd_idx = self.first_queue_iter.fetch_add(1, SeqCst) % self.num_threads;
             let sender = &self.first_queues[thd_idx];
-            sender
-                .send(ArcTask::new(
-                    task,
-                    sender.clone(),
-                    self.queues.clone(),
-                    atom_index.clone(),
-                    atom_elapsed.clone(),
-                    nice,
-                    token,
-                ))
-                .unwrap();
+            match sender.try_send(ArcTask::new(
+                task,
+                sender.clone(),
+                self.queues.clone(),
+                atom_index.clone(),
+                atom_elapsed.clone(),
+                nice,
+                token,
+            )) {
+                Ok(_) => {}
+                Err(e) => {
+                    self.queues[1].send(e.into_inner()).unwrap();
+                }
+            }
         } else {
             self.queues[index]
                 .send(ArcTask::new(
@@ -222,7 +228,7 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     let task_elapsed = task.0.elapsed.clone();
     // adjust queue level
     let mut index = task.0.index.load(SeqCst);
-    if incoming_index != index {
+    if incoming_index < index {
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
@@ -238,7 +244,11 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     // polling
     let begin = Instant::now();
     task.poll();
-    let elapsed = begin.elapsed().as_micros() as u64;
+    let mut elapsed = begin.elapsed().as_micros() as u64;
+    if elapsed > 5 {
+        elapsed = 5;
+    }
+
     if incoming_index == 0 {
         SMALL_TASK_CNT.fetch_add(elapsed, SeqCst);
     } else {
