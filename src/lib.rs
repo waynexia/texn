@@ -7,6 +7,7 @@ use futures::prelude::*;
 use lazy_static::lazy_static;
 use num_cpus;
 use serde::Deserialize;
+use time::SteadyTime;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -35,7 +36,8 @@ struct Config {
 
 lazy_static! {
     static ref CONFIG: Config = {
-        Config {num_thread: num_cpus::get_physical(),
+        // Config {num_thread: num_cpus::get_physical(),
+        Config {num_thread: num_cpus::get(),
         swap_interval: 20,
         queue_privilige: vec![32, 4, 1],
         time_feedback: vec![1000, 300_000, 10_000_000],
@@ -126,6 +128,7 @@ impl ThreadPool {
                         }
                     }
                     if unsafe { unlikely(is_empty) } {
+                        // println!("into select");
                         let oper = sel.select();
                         let rx = rx_map.get(&oper.index()).unwrap();
                         if let Ok(task) = oper.recv(*rx) {
@@ -142,12 +145,14 @@ impl ThreadPool {
                 thread::sleep(Duration::from_secs(1));
                 let small = unsafe { SMALL_TASK_CNT };
                 let huge = unsafe { HUGE_TASK_CNT };
-                if unsafe { unlikely((small + huge) == 0) } {
+                if unsafe { unlikely(huge == 0) } {
+                    // println!("set to max privilege");
+                    FIRST_PRIVILEGE.store(*MAX_PRI, SeqCst);
                     continue;
                 }
                 let cur_perc: u64 = small * 100 / (small + huge);
                 let first_privilege = FIRST_PRIVILEGE.load(SeqCst);
-                // println!("{}  {} -> {}\t{}", a, b, cur_perc, first_privilege);
+                // println!("{}  {} -> {}\t{}", small, huge, cur_perc, first_privilege);
                 // need to decrease first priority
                 if cur_perc > *PERCENTAGE + 5 {
                     let mut new_pri = first_privilege / 2;
@@ -229,30 +234,30 @@ impl ThreadPool {
 
 unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     let task_elapsed = task.0.elapsed.clone();
-    // adjust queue level
+    // adjust priority
     let mut index = task.0.index.load(SeqCst);
     if unlikely(incoming_index < index) {
+        println!("resend {}, {}", incoming_index, index);
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
-    if unlikely(task_elapsed.load(SeqCst) > TIME_FEEDBACK[index])
-        && index < TIME_FEEDBACK.len() - 1
-        && task.0.nice != 0
-    {
-        index += 1;
-        task.0.index.store(index, SeqCst);
-        task.0.queues[index].send(clone_task(&*task.0)).unwrap();
-        return;
-    }
+    // if unlikely(task_elapsed.load(SeqCst) > TIME_FEEDBACK[index])
+    //     && index < TIME_FEEDBACK.len() - 1
+    //     && task.0.nice != 0
+    // {
+    //     // println!("downgrade to {}", index + 1);
+    //     index += 1;
+    //     task.0.index.store(index, SeqCst);
+    //     task.0.queues[index].send(clone_task(&*task.0)).unwrap();
+    //     return;
+    // }
+
     // polling
     let begin = Instant::now();
     task.poll();
-    let mut elapsed = begin.elapsed().as_micros() as u64;
-    if unlikely(elapsed > 5) {
-        elapsed = 5;
-    }
+    let elapsed = begin.elapsed().as_micros() as u64;
 
-    if likely(incoming_index == 0) {
+    if likely(index == 0) {
         SMALL_TASK_CNT += elapsed;
     } else {
         HUGE_TASK_CNT += elapsed;
@@ -300,6 +305,7 @@ unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
 impl ArcTask {
+    #[inline]
     fn new<F>(
         future: F,
         local_queue: Sender<ArcTask>,
@@ -326,6 +332,7 @@ impl ArcTask {
         unsafe { task(future) }
     }
 
+    #[inline]
     unsafe fn poll(self) {
         self.0.status.store(POLLING, SeqCst);
         let waker = ManuallyDrop::new(waker(&*self.0));
@@ -346,6 +353,7 @@ impl ArcTask {
     }
 }
 
+#[inline]
 unsafe fn waker(task: *const Task) -> Waker {
     Waker::from_raw(RawWaker::new(
         task as *const (),
@@ -353,6 +361,7 @@ unsafe fn waker(task: *const Task) -> Waker {
     ))
 }
 
+#[inline]
 unsafe fn clone_raw(this: *const ()) -> RawWaker {
     let task = clone_task(this as *const Task);
     RawWaker::new(
@@ -361,10 +370,12 @@ unsafe fn clone_raw(this: *const ()) -> RawWaker {
     )
 }
 
+#[inline]
 unsafe fn drop_raw(this: *const ()) {
     drop(task(this as *const Task))
 }
 
+#[inline]
 unsafe fn wake_raw(this: *const ()) {
     let task = task(this as *const Task);
     let mut status = task.0.status.load(SeqCst);
@@ -404,6 +415,7 @@ unsafe fn wake_raw(this: *const ()) {
     }
 }
 
+#[inline]
 unsafe fn wake_ref_raw(this: *const ()) {
     let task = ManuallyDrop::new(task(this as *const Task));
     let mut status = task.0.status.load(SeqCst);
@@ -443,10 +455,12 @@ unsafe fn wake_ref_raw(this: *const ()) {
     }
 }
 
+#[inline]
 unsafe fn task(future: *const Task) -> ArcTask {
     ArcTask(Arc::from_raw(future))
 }
 
+#[inline]
 unsafe fn clone_task(future: *const Task) -> ArcTask {
     let task = task(future);
     forget(task.clone());
