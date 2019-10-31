@@ -7,7 +7,6 @@ use futures::prelude::*;
 use lazy_static::lazy_static;
 use num_cpus;
 use serde::Deserialize;
-use time::SteadyTime;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -66,6 +65,8 @@ lazy_static! {
 static mut SMALL_TASK_CNT: u64 = 0;
 static mut HUGE_TASK_CNT: u64 = 0;
 
+pub static TOTAL_SELECT: AtomicU64 = AtomicU64::new(0);
+
 // external upper level tester
 use adaptive_spawn::{AdaptiveSpawn, Options};
 
@@ -91,12 +92,12 @@ impl ThreadPool {
             queues.push(tx);
             rxs.push(rx);
         }
-        // create stats
+        // init
         let stats = DropMap::new(CONFIG.swap_interval);
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
         // spawn worker threads
         for _ in 0..num_threads {
-            let (tx, rx) = channel::bounded(4096);
+            let (tx, rx) = channel::unbounded();
             first_queues.push(tx.clone());
             let mut rxs = rxs.clone();
             rxs.push(rx);
@@ -128,7 +129,11 @@ impl ThreadPool {
                         }
                     }
                     if unsafe { unlikely(is_empty) } {
-                        // println!("into select");
+                        thread::sleep(Duration::from_micros(30));
+
+                        TOTAL_SELECT.fetch_add(1, SeqCst);
+
+                        // let _ = sel.ready();
                         let oper = sel.select();
                         let rx = rx_map.get(&oper.index()).unwrap();
                         if let Ok(task) = oper.recv(*rx) {
@@ -203,6 +208,7 @@ impl ThreadPool {
                 self.queues.clone(),
                 atom_index.clone(),
                 atom_elapsed.clone(),
+                // self.semaphores.clone(),
                 nice,
                 token,
             )) {
@@ -211,6 +217,8 @@ impl ThreadPool {
                     self.queues[1].send(e.into_inner()).unwrap();
                 }
             }
+        // wake up worker
+        // let _ = self.semaphores[thd_idx].try_send(());
         } else {
             self.queues[index]
                 .send(ArcTask::new(
@@ -220,10 +228,14 @@ impl ThreadPool {
                     self.queues.clone(),
                     atom_index.clone(),
                     atom_elapsed.clone(),
+                    // self.semaphores.clone(),
                     nice,
                     token,
                 ))
                 .unwrap();
+            // for idx in 0..self.num_threads {
+            //     let _ = self.semaphores[idx].try_send(());
+            // }
         }
     }
 
@@ -237,20 +249,20 @@ unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     // adjust priority
     let mut index = task.0.index.load(SeqCst);
     if unlikely(incoming_index < index) {
-        println!("resend {}, {}", incoming_index, index);
+        // println!("resend {}, {}", incoming_index, index);
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
-    // if unlikely(task_elapsed.load(SeqCst) > TIME_FEEDBACK[index])
-    //     && index < TIME_FEEDBACK.len() - 1
-    //     && task.0.nice != 0
-    // {
-    //     // println!("downgrade to {}", index + 1);
-    //     index += 1;
-    //     task.0.index.store(index, SeqCst);
-    //     task.0.queues[index].send(clone_task(&*task.0)).unwrap();
-    //     return;
-    // }
+    if unlikely(task_elapsed.load(SeqCst) > TIME_FEEDBACK[index])
+        && index < TIME_FEEDBACK.len() - 1
+        && task.0.nice != 0
+    {
+        // println!("downgrade to {}", index + 1);
+        index += 1;
+        task.0.index.store(index, SeqCst);
+        task.0.queues[index].send(clone_task(&*task.0)).unwrap();
+        return;
+    }
 
     // polling
     let begin = Instant::now();
@@ -289,6 +301,7 @@ struct Task {
     index: Arc<AtomicUsize>,
     // this token's total epalsed time
     elapsed: Arc<AtomicU64>,
+    // semaphores: Vec<Sender<()>>,
     nice: u8,
     _token: u64,
 }
@@ -312,6 +325,7 @@ impl ArcTask {
         queues: Arc<[Sender<ArcTask>]>,
         index: Arc<AtomicUsize>,
         elapsed: Arc<AtomicU64>,
+        // semaphores: Vec<Sender<()>>,
         nice: u8,
         token: u64,
     ) -> ArcTask
@@ -325,6 +339,7 @@ impl ArcTask {
             status: AtomicU8::new(WAITING),
             index,
             elapsed,
+            // semaphores,
             nice,
             _token: token,
         });
@@ -395,6 +410,9 @@ unsafe fn wake_raw(this: *const ()) {
                             &task.0.queues[index]
                         };
                         sender.send(clone_task(&*task.0)).unwrap();
+                        // for V in &task.0.semaphores {
+                        //     let _ = V.try_send(());
+                        // }
                         break;
                     }
                     Err(cur) => status = cur,
@@ -435,6 +453,9 @@ unsafe fn wake_ref_raw(this: *const ()) {
                             &task.0.queues[index]
                         };
                         sender.send(clone_task(&*task.0)).unwrap();
+                        // for V in &task.0.semaphores {
+                        //     let _ = V.try_send(());
+                        // }
                         break;
                     }
                     Err(cur) => status = cur,
