@@ -15,3 +15,5 @@ have chances to be executed so starvation problem is avoided.
 - [x] take time into consideration
 - [ ] after polled one task, try to push it in the front rather than tail
 - [x] dynamic adjust which queue a task belong to
+- [ ] when waking up a task and going to push it into a task queue again, consider 
+the thread-local queue can changed

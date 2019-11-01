@@ -1,6 +1,5 @@
 #![feature(core_intrinsics)]
 
-use crossbeam::channel::Select;
 use crossbeam::{channel, Sender};
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -9,7 +8,6 @@ use num_cpus;
 use serde::Deserialize;
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::future::Future;
 use std::intrinsics::{likely, unlikely};
 use std::mem::{forget, ManuallyDrop};
@@ -70,9 +68,26 @@ pub static TOTAL_SELECT: AtomicU64 = AtomicU64::new(0);
 // external upper level tester
 use adaptive_spawn::{AdaptiveSpawn, Options};
 
+struct ThreadCtx {
+    handle: thread::JoinHandle<()>,
+    todo_cnt: Arc<AtomicU64>,
+}
+
+impl ThreadCtx {
+    fn unpark(&self) {
+        self.handle.thread().unpark();
+    }
+
+    pub fn notify_once(&self) {
+        if self.todo_cnt.fetch_add(1, SeqCst) > 9 {
+            self.unpark();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ThreadPool {
-    // first priority, thread independent task queues
+    // first priority, thread local task queues
     first_queues: Vec<Sender<ArcTask>>,
     // other shared queues
     queues: Arc<[Sender<ArcTask>]>,
@@ -80,6 +95,7 @@ pub struct ThreadPool {
     stats: DropMap<u64, (Arc<AtomicU64>, Arc<AtomicUsize>)>,
     num_threads: usize,
     first_queue_iter: Arc<AtomicUsize>,
+    thds: Vec<Arc<ThreadCtx>>,
 }
 
 impl ThreadPool {
@@ -95,6 +111,7 @@ impl ThreadPool {
         // init
         let stats = DropMap::new(CONFIG.swap_interval);
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
+        let mut thds = vec![];
         // spawn worker threads
         for _ in 0..num_threads {
             let (tx, rx) = channel::unbounded();
@@ -103,46 +120,40 @@ impl ThreadPool {
             rxs.push(rx);
             rxs.swap_remove(0);
             let f = f.clone();
-            thread::spawn(move || {
-                f();
-                let mut sel = Select::new();
-                let mut rx_map = HashMap::new();
-                for rx in &rxs {
-                    let idx = sel.recv(rx);
-                    rx_map.insert(idx, rx);
-                }
-                loop {
-                    let mut is_empty = true;
-                    for ((rx, &limit), index) in
-                        rxs.iter().zip(QUEUE_PRIVILEGE.into_iter()).zip(0..)
-                    {
-                        if unsafe { likely(index == 0) } {
-                            for task in rx.try_iter().take(FIRST_PRIVILEGE.load(SeqCst) as usize) {
-                                is_empty = false;
-                                unsafe { poll_with_timer(task, index) };
-                            }
-                        } else {
-                            for task in rx.try_iter().take(limit as usize) {
-                                is_empty = false;
-                                unsafe { poll_with_timer(task, index) };
+            let todo_cnt_param = Arc::new(AtomicU64::new(0));
+            let todo_cnt = todo_cnt_param.clone();
+            thds.push(Arc::new(ThreadCtx {
+                handle: thread::spawn(move || {
+                    f();
+                    loop {
+                        let mut is_empty = true;
+                        for ((rx, &limit), index) in
+                            rxs.iter().zip(QUEUE_PRIVILEGE.into_iter()).zip(0..)
+                        {
+                            if unsafe { likely(index == 0) } {
+                                for task in
+                                    rx.try_iter().take(FIRST_PRIVILEGE.load(SeqCst) as usize)
+                                {
+                                    is_empty = false;
+                                    unsafe { poll_with_timer(task, index) };
+                                }
+                            } else {
+                                for task in rx.try_iter().take(limit as usize) {
+                                    is_empty = false;
+                                    unsafe { poll_with_timer(task, index) };
+                                }
                             }
                         }
-                    }
-                    if unsafe { unlikely(is_empty) } {
-                        thread::sleep(Duration::from_micros(30));
+                        if unsafe { unlikely(is_empty) } {
+                            thread::park_timeout(Duration::from_micros(30));
+                            todo_cnt.store(0, SeqCst);
 
-                        TOTAL_SELECT.fetch_add(1, SeqCst);
-
-                        // let _ = sel.ready();
-                        let oper = sel.select();
-                        let rx = rx_map.get(&oper.index()).unwrap();
-                        if let Ok(task) = oper.recv(*rx) {
-                            let index = task.0.index.load(SeqCst);
-                            unsafe { poll_with_timer(task, index) };
+                            TOTAL_SELECT.fetch_add(1, SeqCst);
                         }
                     }
-                }
-            });
+                }),
+                todo_cnt: todo_cnt_param,
+            }));
         }
         // spawn adjustor thread
         thread::spawn(move || {
@@ -187,6 +198,7 @@ impl ThreadPool {
             stats,
             num_threads,
             first_queue_iter: Arc::default(),
+            thds,
         }
     }
 
@@ -199,16 +211,17 @@ impl ThreadPool {
             .stats
             .get_or_insert(&token, (Arc::default(), Arc::default()));
         let index = atom_index.load(SeqCst);
+        // first priority, will be send into thread local queue
         if unsafe { likely(index == 0 || nice == 0) } {
             let thd_idx = self.first_queue_iter.fetch_add(1, SeqCst) % self.num_threads;
             let sender = &self.first_queues[thd_idx];
             match sender.try_send(ArcTask::new(
                 task,
                 sender.clone(),
+                self.thds[index].clone(),
                 self.queues.clone(),
                 atom_index.clone(),
                 atom_elapsed.clone(),
-                // self.semaphores.clone(),
                 nice,
                 token,
             )) {
@@ -217,25 +230,23 @@ impl ThreadPool {
                     self.queues[1].send(e.into_inner()).unwrap();
                 }
             }
-        // wake up worker
-        // let _ = self.semaphores[thd_idx].try_send(());
-        } else {
+            self.thds[index].notify_once();
+        }
+        // other priority, belongs to shared queue
+        else {
             self.queues[index]
                 .send(ArcTask::new(
                     task,
                     // don't care
                     self.first_queues[0].clone(),
+                    self.thds[index].clone(),
                     self.queues.clone(),
                     atom_index.clone(),
                     atom_elapsed.clone(),
-                    // self.semaphores.clone(),
                     nice,
                     token,
                 ))
                 .unwrap();
-            // for idx in 0..self.num_threads {
-            //     let _ = self.semaphores[idx].try_send(());
-            // }
         }
     }
 
@@ -246,13 +257,14 @@ impl ThreadPool {
 
 unsafe fn poll_with_timer(task: ArcTask, incoming_index: usize) {
     let task_elapsed = task.0.elapsed.clone();
-    // adjust priority
     let mut index = task.0.index.load(SeqCst);
+    // check uncompatible priority
     if unlikely(incoming_index < index) {
         // println!("resend {}, {}", incoming_index, index);
         task.0.queues[index].send(clone_task(&*task.0)).unwrap();
         return;
     }
+    // adjust priority
     if unlikely(task_elapsed.load(SeqCst) > TIME_FEEDBACK[index])
         && index < TIME_FEEDBACK.len() - 1
         && task.0.nice != 0
@@ -292,16 +304,18 @@ impl Default for ThreadPool {
     }
 }
 
+/// A task contains local_queue, this is the thread-local queue where it originally comes from
+/// should it be send into other thread-local queue when waking up?
 struct Task {
     task: UnsafeCell<BoxFuture<'static, ()>>,
     local_queue: Sender<ArcTask>,
+    thd: Arc<ThreadCtx>,
     queues: Arc<[Sender<ArcTask>]>,
     status: AtomicU8,
     // this task belongs to which queue
     index: Arc<AtomicUsize>,
     // this token's total epalsed time
     elapsed: Arc<AtomicU64>,
-    // semaphores: Vec<Sender<()>>,
     nice: u8,
     _token: u64,
 }
@@ -322,10 +336,10 @@ impl ArcTask {
     fn new<F>(
         future: F,
         local_queue: Sender<ArcTask>,
+        thd: Arc<ThreadCtx>,
         queues: Arc<[Sender<ArcTask>]>,
         index: Arc<AtomicUsize>,
         elapsed: Arc<AtomicU64>,
-        // semaphores: Vec<Sender<()>>,
         nice: u8,
         token: u64,
     ) -> ArcTask
@@ -335,11 +349,11 @@ impl ArcTask {
         let future = Arc::new(Task {
             task: UnsafeCell::new(future.boxed()),
             local_queue,
+            thd,
             queues,
             status: AtomicU8::new(WAITING),
             index,
             elapsed,
-            // semaphores,
             nice,
             _token: token,
         });
@@ -410,9 +424,9 @@ unsafe fn wake_raw(this: *const ()) {
                             &task.0.queues[index]
                         };
                         sender.send(clone_task(&*task.0)).unwrap();
-                        // for V in &task.0.semaphores {
-                        //     let _ = V.try_send(());
-                        // }
+                        if index == 0 {
+                            task.0.thd.notify_once();
+                        }
                         break;
                     }
                     Err(cur) => status = cur,
@@ -453,9 +467,9 @@ unsafe fn wake_ref_raw(this: *const ()) {
                             &task.0.queues[index]
                         };
                         sender.send(clone_task(&*task.0)).unwrap();
-                        // for V in &task.0.semaphores {
-                        //     let _ = V.try_send(());
-                        // }
+                        if index == 0 {
+                            task.0.thd.notify_once();
+                        }
                         break;
                     }
                     Err(cur) => status = cur,
