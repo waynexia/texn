@@ -11,7 +11,7 @@ use std::cell::UnsafeCell;
 use std::future::Future;
 use std::intrinsics::{likely, unlikely};
 use std::mem::{forget, ManuallyDrop};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
@@ -35,7 +35,7 @@ lazy_static! {
     static ref CONFIG: Config = {
         // Config {num_thread: num_cpus::get_physical(),
         Config {num_thread: num_cpus::get(),
-        swap_interval: 20,
+        swap_interval: 30,
         queue_privilige: vec![32, 4, 1],
         time_feedback: vec![1000, 300_000, 10_000_000],
         percentage: 80,
@@ -69,18 +69,31 @@ pub static TOTAL_SELECT: AtomicU64 = AtomicU64::new(0);
 use adaptive_spawn::{AdaptiveSpawn, Options};
 
 struct ThreadCtx {
-    handle: thread::JoinHandle<()>,
+    // handle: Arc<thread::JoinHandle<()>>,
     todo_cnt: Arc<AtomicU64>,
+    me: usize,
+    // ctxs: Arc<Vec<Arc<ThreadCtx>>>,
+    is_parking: Arc<Vec<Arc<AtomicBool>>>,
+    thds: Arc<Vec<Arc<thread::JoinHandle<()>>>>,
 }
 
 impl ThreadCtx {
     fn unpark(&self) {
-        self.handle.thread().unpark();
+        self.thds[self.me].thread().unpark();
     }
 
     pub fn notify_once(&self) {
-        if self.todo_cnt.fetch_add(1, SeqCst) > 9 {
+        if self.todo_cnt.fetch_add(1, SeqCst) > 32 {
             self.unpark();
+        }
+    }
+
+    pub fn unpark_one(&self) {
+        for index in 0..CONFIG.num_thread {
+            if self.is_parking[index].load(SeqCst) {
+                self.thds[self.me].thread().unpark();
+                break;
+            }
         }
     }
 }
@@ -95,7 +108,7 @@ pub struct ThreadPool {
     stats: DropMap<u64, (Arc<AtomicU64>, Arc<AtomicUsize>)>,
     num_threads: usize,
     first_queue_iter: Arc<AtomicUsize>,
-    thds: Vec<Arc<ThreadCtx>>,
+    ctxs: Arc<Vec<Arc<ThreadCtx>>>,
 }
 
 impl ThreadPool {
@@ -112,6 +125,10 @@ impl ThreadPool {
         let stats = DropMap::new(CONFIG.swap_interval);
         let queues: Arc<[Sender<ArcTask>]> = Arc::from(queues.into_boxed_slice());
         let mut thds = vec![];
+        let ctxs = vec![];
+        let mut ctxs = Arc::new(ctxs);
+        let mut todo_cnt_container = vec![];
+        let mut is_parking_container = vec![];
         // spawn worker threads
         for _ in 0..num_threads {
             let (tx, rx) = channel::unbounded();
@@ -122,38 +139,52 @@ impl ThreadPool {
             let f = f.clone();
             let todo_cnt_param = Arc::new(AtomicU64::new(0));
             let todo_cnt = todo_cnt_param.clone();
-            thds.push(Arc::new(ThreadCtx {
-                handle: thread::spawn(move || {
-                    f();
-                    loop {
-                        let mut is_empty = true;
-                        for ((rx, &limit), index) in
-                            rxs.iter().zip(QUEUE_PRIVILEGE.into_iter()).zip(0..)
-                        {
-                            if unsafe { likely(index == 0) } {
-                                for task in
-                                    rx.try_iter().take(FIRST_PRIVILEGE.load(SeqCst) as usize)
-                                {
-                                    is_empty = false;
-                                    unsafe { poll_with_timer(task, index) };
-                                }
-                            } else {
-                                for task in rx.try_iter().take(limit as usize) {
-                                    is_empty = false;
-                                    unsafe { poll_with_timer(task, index) };
-                                }
+            todo_cnt_container.push(todo_cnt_param);
+            let is_parking_param = Arc::new(AtomicBool::new(false));
+            let is_parking = is_parking_param.clone();
+            is_parking_container.push(is_parking_param);
+            thds.push(Arc::new(thread::spawn(move || {
+                f();
+                loop {
+                    let mut is_empty = true;
+                    for ((rx, &limit), index) in
+                        rxs.iter().zip(QUEUE_PRIVILEGE.into_iter()).zip(0..)
+                    {
+                        if unsafe { likely(index == 0) } {
+                            for task in rx.try_iter().take(FIRST_PRIVILEGE.load(SeqCst) as usize) {
+                                is_empty = false;
+                                unsafe { poll_with_timer(task, index) };
+                            }
+                        } else {
+                            for task in rx.try_iter().take(limit as usize) {
+                                is_empty = false;
+                                unsafe { poll_with_timer(task, index) };
                             }
                         }
-                        if unsafe { unlikely(is_empty) } {
-                            thread::park_timeout(Duration::from_micros(30));
-                            todo_cnt.store(0, SeqCst);
-
-                            TOTAL_SELECT.fetch_add(1, SeqCst);
-                        }
                     }
-                }),
-                todo_cnt: todo_cnt_param,
-            }));
+                    if unsafe { unlikely(is_empty) } {
+                        todo_cnt.store(0, SeqCst);
+                        is_parking.store(true, SeqCst);
+                        thread::park_timeout(Duration::from_micros(50));
+                        todo_cnt.store(0, SeqCst);
+                        is_parking.store(false, SeqCst);
+
+                        TOTAL_SELECT.fetch_add(1, SeqCst);
+                    }
+                }
+            })));
+        }
+        // construct ctxs
+        for index in 0..CONFIG.num_thread {
+            let ctx = Arc::new(ThreadCtx {
+                // handle: thds[index].clone(),
+                todo_cnt: todo_cnt_container[index].clone(),
+                me: index,
+                // ctxs: ctxs.clone(),
+                is_parking: Arc::new(is_parking_container.clone()),
+                thds: Arc::new(thds.clone()),
+            });
+            Arc::get_mut(&mut ctxs).unwrap().push(ctx);
         }
         // spawn adjustor thread
         thread::spawn(move || {
@@ -198,7 +229,7 @@ impl ThreadPool {
             stats,
             num_threads,
             first_queue_iter: Arc::default(),
-            thds,
+            ctxs,
         }
     }
 
@@ -218,7 +249,7 @@ impl ThreadPool {
             match sender.try_send(ArcTask::new(
                 task,
                 sender.clone(),
-                self.thds[index].clone(),
+                self.ctxs[index].clone(),
                 self.queues.clone(),
                 atom_index.clone(),
                 atom_elapsed.clone(),
@@ -230,7 +261,7 @@ impl ThreadPool {
                     self.queues[1].send(e.into_inner()).unwrap();
                 }
             }
-            self.thds[index].notify_once();
+            self.ctxs[index].notify_once();
         }
         // other priority, belongs to shared queue
         else {
@@ -239,7 +270,7 @@ impl ThreadPool {
                     task,
                     // don't care
                     self.first_queues[0].clone(),
-                    self.thds[index].clone(),
+                    self.ctxs[index].clone(),
                     self.queues.clone(),
                     atom_index.clone(),
                     atom_elapsed.clone(),
@@ -247,6 +278,7 @@ impl ThreadPool {
                     token,
                 ))
                 .unwrap();
+            self.ctxs[index].unpark_one();
         }
     }
 
@@ -426,6 +458,8 @@ unsafe fn wake_raw(this: *const ()) {
                         sender.send(clone_task(&*task.0)).unwrap();
                         if index == 0 {
                             task.0.thd.notify_once();
+                        } else {
+                            task.0.thd.unpark_one();
                         }
                         break;
                     }
@@ -469,6 +503,8 @@ unsafe fn wake_ref_raw(this: *const ()) {
                         sender.send(clone_task(&*task.0)).unwrap();
                         if index == 0 {
                             task.0.thd.notify_once();
+                        } else {
+                            task.0.thd.unpark_one();
                         }
                         break;
                     }
